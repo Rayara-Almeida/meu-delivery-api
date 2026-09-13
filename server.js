@@ -72,6 +72,45 @@ app.post('/usuarios', async (req, res) => {
         });
     }
 });
+app.post('/clientes', async (req, res) => {
+    try {
+        const { nome, email, telefone, senha } = req.body;
+
+        if (!nome || !email || !senha) {
+            return res.status(400).json({
+                mensagem: 'Nome, e-mail e senha são obrigatórios.'
+            });
+        }
+
+        const senhaHash = await bcrypt.hash(senha, 10);
+
+        const resultado = await pool.query(
+            `INSERT INTO usuario
+            (nome, email, telefone, senha, id_perfil)
+            VALUES ($1, $2, $3, $4, 3)
+            RETURNING id_usuario, nome, email, telefone, id_perfil`,
+            [nome, email, telefone, senhaHash]
+        );
+
+        res.status(201).json({
+            mensagem: 'Cliente cadastrado com sucesso!',
+            usuario: resultado.rows[0]
+        });
+
+    } catch (erro) {
+        console.error(erro);
+
+        if (erro.code === '23505') {
+            return res.status(409).json({
+                mensagem: 'E-mail já cadastrado.'
+            });
+        }
+
+        res.status(500).json({
+            mensagem: 'Erro ao cadastrar cliente.'
+        });
+    }
+});
 app.post('/login', async (req, res) => {
     try {
         const { email, senha } = req.body;
