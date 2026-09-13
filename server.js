@@ -136,6 +136,69 @@ app.post('/login', async (req, res) => {
         });
     }
 });
+app.get('/loja/status', autenticarToken, verificarPerfil(2), async (req, res) => {
+    try {
+        const resultado = await pool.query(
+            `SELECT 
+                l.id_loja,
+                l.nome,
+                l.aberta,
+                h.hora_abertura,
+                h.hora_fechamento
+             FROM loja l
+             LEFT JOIN horario_funcionamento h
+                ON l.id_loja = h.id_loja
+                AND h.dia_semana = LOWER(
+                    CASE EXTRACT(DOW FROM CURRENT_DATE)
+                        WHEN 0 THEN 'domingo'
+                        WHEN 1 THEN 'segunda'
+                        WHEN 2 THEN 'terça'
+                        WHEN 3 THEN 'quarta'
+                        WHEN 4 THEN 'quinta'
+                        WHEN 5 THEN 'sexta'
+                        WHEN 6 THEN 'sábado'
+                    END
+                )
+             WHERE l.id_usuario = $1`,
+            [req.usuario.id_usuario]
+        );
+
+        if (resultado.rows.length === 0) {
+            return res.status(404).json({
+                mensagem: 'Loja não encontrada.'
+            });
+        }
+
+        const loja = resultado.rows[0];
+
+        const agora = new Date();
+        const horaAtual = agora.toTimeString().slice(0, 8);
+
+        const dentroHorario = Boolean(
+            loja.hora_abertura &&
+            loja.hora_fechamento &&
+            horaAtual >= loja.hora_abertura &&
+            horaAtual <= loja.hora_fechamento
+        );
+
+        const estaAberta = loja.aberta && dentroHorario;
+
+        res.json({
+            id_loja: loja.id_loja,
+            nome: loja.nome,
+            aberta: estaAberta,
+            interruptor_aberto: loja.aberta,
+            dentro_horario: dentroHorario
+        });
+
+    } catch (erro) {
+        console.error(erro);
+
+        res.status(500).json({
+            mensagem: 'Erro ao verificar status da loja.'
+        });
+    }
+});
 app.get('/perfil', autenticarToken, async (req, res) => {
     try {
         const resultado = await pool.query(
