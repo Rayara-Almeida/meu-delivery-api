@@ -2,12 +2,12 @@
 -- PostgreSQL database dump
 --
 
-\restrict IBgepoBBkHfqeHMKQbgxyYk2lCIvVlvQh3Sc0ePZdNRyBnBe5tPLDpc2aVn8MsS
+\restrict Ksm1Rg9b9SGLkMhoJ9qesgpfy4YEtJEOJa2B8mshIfm5wtd8OUD64ZgZabBaAaH
 
 -- Dumped from database version 18.3
 -- Dumped by pg_dump version 18.3
 
--- Started on 2026-09-13 18:03:48
+-- Started on 2026-09-15 20:53:26
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -121,6 +121,8 @@ CREATE TABLE public.loja (
     endereco character varying(200) NOT NULL,
     telefone character varying(20) NOT NULL,
     aberta boolean DEFAULT false NOT NULL,
+    tempo_estimado integer,
+    taxa numeric(10,2),
     CONSTRAINT chk_categoria CHECK (((categoria)::text = ANY ((ARRAY['lanches'::character varying, 'pizzaria'::character varying, 'açaí'::character varying, 'mercado'::character varying])::text[])))
 );
 
@@ -303,8 +305,8 @@ COPY public.horario_funcionamento (id_horario, id_loja, dia_semana, hora_abertur
 -- Data for Name: loja; Type: TABLE DATA; Schema: public; Owner: postgres
 --
 
-COPY public.loja (id_loja, id_usuario, nome, foto, categoria, endereco, telefone, aberta) FROM stdin;
-1	5	Loja Teste	https://exemplo.com/foto-loja.jpg	lanches	Rua Principal, 100	87977777777	f
+COPY public.loja (id_loja, id_usuario, nome, foto, categoria, endereco, telefone, aberta, tempo_estimado, taxa) FROM stdin;
+1	5	Loja Teste	https://exemplo.com/foto-loja.jpg	lanches	Rua Principal, 100	87977777777	f	40	5.00
 \.
 
 
@@ -329,6 +331,11 @@ COPY public.perfil (id_perfil, nome) FROM stdin;
 --
 
 COPY public.usuario (id_usuario, nome, email, telefone, senha, id_perfil) FROM stdin;
+3	Maria Teste	maria.teste@email.com	87999999999	$2b$10$59BQF.aKDNhJsuH0nX2S8./TjtRjS/5EewqB00F82ngY73Vfz/8s6	3
+4	Admin Teste	admin.teste@email.com	87988888888	$2b$10$H.73BTYh/llw9emQ15tHUO8yQQ9pYtu44v4MKixKat/wBQJ.z2gH6	1
+5	Loja Teste	loja.teste@email.com	87977777777	$2b$10$bYGkBXRkeCwk7poaWmKM9.JYI0b79vuhSUzkLP.LP5buQa3luOgCS	2
+6	Entregador Teste	entregador.teste@email.com	87966666666	$2b$10$jWyHoBMzDpCNEnW36W20LuaHrLaLwVJfXtb40PtL52MJSkmo2M2K2	4
+7	Cliente Teste	cliente.teste@email.com	87955555555	$2b$10$e59zZ8pJfoSNq0YFvmvRJOsUuWzeec9bXyxH0Sy.iFfVip9HUaYqO	3
 \.
 
 
@@ -374,7 +381,7 @@ SELECT pg_catalog.setval('public.perfil_id_perfil_seq', 4, true);
 -- Name: usuario_id_usuario_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
 --
 
-SELECT pg_catalog.setval('public.usuario_id_usuario_seq', 6, true);
+SELECT pg_catalog.setval('public.usuario_id_usuario_seq', 7, true);
 
 
 --
@@ -475,11 +482,11 @@ ALTER TABLE ONLY public.usuario
     ADD CONSTRAINT fk_usuario_perfil FOREIGN KEY (id_perfil) REFERENCES public.perfil(id_perfil);
 
 
--- Completed on 2026-09-13 18:03:49
+-- Completed on 2026-09-15 20:53:26
 
 --
 -- PostgreSQL database dump complete
 --
 
-\unrestrict IBgepoBBkHfqeHMKQbgxyYk2lCIvVlvQh3Sc0ePZdNRyBnBe5tPLDpc2aVn8MsS
+\unrestrict Ksm1Rg9b9SGLkMhoJ9qesgpfy4YEtJEOJa2B8mshIfm5wtd8OUD64ZgZabBaAaH
 

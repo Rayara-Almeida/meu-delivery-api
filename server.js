@@ -238,6 +238,94 @@ app.get('/loja/status', autenticarToken, verificarPerfil(2), async (req, res) =>
         });
     }
 });
+app.get('/lojas', async (req, res) => {
+    try {
+        const { nome, categoria } = req.query;
+
+        const parametros = [];
+        const filtros = [];
+
+        if (nome) {
+            parametros.push(`%${nome}%`);
+            filtros.push(`LOWER(l.nome) LIKE LOWER($${parametros.length})`);
+        }
+
+        if (categoria) {
+            parametros.push(categoria);
+            filtros.push(`LOWER(l.categoria) = LOWER($${parametros.length})`);
+        }
+
+        const filtroSQL = filtros.length > 0
+            ? `WHERE ${filtros.join(' AND ')}`
+            : '';
+
+        const resultado = await pool.query(
+            `
+            SELECT
+                l.id_loja,
+                l.nome,
+                l.foto,
+                l.categoria,
+                l.tempo_estimado,
+                l.taxa,
+                l.aberta,
+                h.hora_abertura,
+                h.hora_fechamento
+            FROM loja l
+            LEFT JOIN horario_funcionamento h
+                ON l.id_loja = h.id_loja
+                AND h.dia_semana = LOWER(
+                    CASE EXTRACT(DOW FROM CURRENT_DATE)
+                        WHEN 0 THEN 'domingo'
+                        WHEN 1 THEN 'segunda'
+                        WHEN 2 THEN 'terça'
+                        WHEN 3 THEN 'quarta'
+                        WHEN 4 THEN 'quinta'
+                        WHEN 5 THEN 'sexta'
+                        WHEN 6 THEN 'sábado'
+                    END
+                )
+            ${filtroSQL}
+            ORDER BY l.nome
+            `,
+            parametros
+        );
+
+        const agora = new Date();
+        const horaAtual = agora.toTimeString().slice(0, 8);
+
+        const lojas = resultado.rows.map(loja => {
+
+            const dentroHorario = Boolean(
+                loja.hora_abertura &&
+                loja.hora_fechamento &&
+                horaAtual >= loja.hora_abertura &&
+                horaAtual <= loja.hora_fechamento
+            );
+
+            const estaAberta = loja.aberta && dentroHorario;
+
+            return {
+                id_loja: loja.id_loja,
+                nome: loja.nome,
+                foto: loja.foto,
+                categoria: loja.categoria,
+                tempo_estimado: loja.tempo_estimado,
+                taxa: loja.taxa,
+                aberta: estaAberta
+            };
+        });
+
+        res.json(lojas);
+
+    } catch (erro) {
+        console.error(erro);
+
+        res.status(500).json({
+            mensagem: 'Erro ao buscar lojas.'
+        });
+    }
+});
 app.get('/perfil', autenticarToken, async (req, res) => {
     try {
         const resultado = await pool.query(
