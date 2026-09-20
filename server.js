@@ -364,6 +364,82 @@ app.get('/loja', autenticarToken, verificarPerfil(2), (req, res) => {
         mensagem: 'Acesso autorizado! Você é da loja.'
     });
 });
+app.post('/loja/faixas-entrega', autenticarToken, verificarPerfil(2), async (req, res) => {
+    try {
+        const { distancia_maxima_km, taxa } = req.body;
+
+        if (!distancia_maxima_km || taxa === undefined) {
+            return res.status(400).json({
+                mensagem: 'Distância máxima e taxa são obrigatórias.'
+            });
+        }
+
+        const loja = await pool.query(
+            `SELECT id_loja
+             FROM loja
+             WHERE id_usuario = $1`,
+            [req.usuario.id_usuario]
+        );
+
+        if (loja.rows.length === 0) {
+            return res.status(404).json({
+                mensagem: 'Loja não encontrada.'
+            });
+        }
+
+        const resultado = await pool.query(
+            `INSERT INTO faixa_entrega
+                (id_loja, distancia_maxima_km, taxa)
+             VALUES ($1, $2, $3)
+             RETURNING id_faixa, id_loja, distancia_maxima_km, taxa`,
+            [
+                loja.rows[0].id_loja,
+                distancia_maxima_km,
+                taxa
+            ]
+        );
+
+        res.status(201).json({
+            mensagem: 'Faixa de entrega cadastrada com sucesso!',
+            faixa: resultado.rows[0]
+        });
+
+    } catch (erro) {
+        console.error(erro);
+
+        res.status(500).json({
+            mensagem: 'Erro ao cadastrar faixa de entrega.'
+        });
+    }
+});
+app.get('/loja/faixas-entrega', autenticarToken, verificarPerfil(2), async (req, res) => {
+    try {
+        const resultado = await pool.query(
+            `SELECT
+                id_faixa,
+                id_loja,
+                distancia_maxima_km,
+                taxa
+             FROM faixa_entrega
+             WHERE id_loja = (
+                 SELECT id_loja
+                 FROM loja
+                 WHERE id_usuario = $1
+             )
+             ORDER BY distancia_maxima_km`,
+            [req.usuario.id_usuario]
+        );
+
+        res.json(resultado.rows);
+
+    } catch (erro) {
+        console.error(erro);
+
+        res.status(500).json({
+            mensagem: 'Erro ao buscar faixas de entrega.'
+        });
+    }
+});
 app.get('/cliente', autenticarToken, verificarPerfil(3), (req, res) => {
     res.json({
         mensagem: 'Acesso autorizado! Você é cliente.'
