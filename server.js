@@ -1284,7 +1284,326 @@ app.get('/entregador', autenticarToken, verificarPerfil(4), (req, res) => {
         mensagem: 'Acesso autorizado! Você é entregador.'
     });
 });
+app.post(
+    '/enderecos',
+    autenticarToken,
+    verificarPerfil(3),
+    async (req, res) => {
+        try {
+            const {
+                rua,
+                numero,
+                complemento,
+                bairro,
+                cidade,
+                ponto_referencia
+            } = req.body;
 
+            if (!rua || !numero || !bairro || !cidade) {
+                return res.status(400).json({
+                    mensagem: 'Rua, número, bairro e cidade são obrigatórios.'
+                });
+            }
+
+            const resultado = await pool.query(
+                `INSERT INTO endereco (
+                    id_usuario,
+                    rua,
+                    numero,
+                    complemento,
+                    bairro,
+                    cidade,
+                    ponto_referencia
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING *`,
+                [
+                    req.usuario.id_usuario,
+                    rua,
+                    numero,
+                    complemento || null,
+                    bairro,
+                    cidade,
+                    ponto_referencia || null
+                ]
+            );
+
+            res.status(201).json({
+                mensagem: 'Endereço cadastrado com sucesso!',
+                endereco: resultado.rows[0]
+            });
+
+        } catch (erro) {
+            console.error(erro);
+
+            res.status(500).json({
+                mensagem: 'Erro ao cadastrar endereço.'
+            });
+        }
+    }
+);
+app.get(
+    '/enderecos',
+    autenticarToken,
+    verificarPerfil(3),
+    async (req, res) => {
+        try {
+            const resultado = await pool.query(
+                `SELECT
+                    id_endereco,
+                    rua,
+                    numero,
+                    complemento,
+                    bairro,
+                    cidade,
+                    ponto_referencia,
+                    favorito
+                 FROM endereco
+                 WHERE id_usuario = $1
+                   AND ativo = TRUE
+                 ORDER BY favorito DESC, id_endereco`,
+                [req.usuario.id_usuario]
+            );
+
+            res.json(resultado.rows);
+
+        } catch (erro) {
+            console.error(erro);
+
+            res.status(500).json({
+                mensagem: 'Erro ao buscar endereços.'
+            });
+        }
+    }
+);
+app.put(
+    '/enderecos/:id',
+    autenticarToken,
+    verificarPerfil(3),
+    async (req, res) => {
+        try {
+            const idEndereco = req.params.id;
+
+            const {
+                rua,
+                numero,
+                complemento,
+                bairro,
+                cidade,
+                ponto_referencia
+            } = req.body;
+
+            if (!rua || !numero || !bairro || !cidade) {
+                return res.status(400).json({
+                    mensagem: 'Rua, número, bairro e cidade são obrigatórios.'
+                });
+            }
+
+            const resultado = await pool.query(
+                `UPDATE endereco
+                 SET
+                    rua = $1,
+                    numero = $2,
+                    complemento = $3,
+                    bairro = $4,
+                    cidade = $5,
+                    ponto_referencia = $6
+                 WHERE id_endereco = $7
+                   AND id_usuario = $8
+                   AND ativo = TRUE
+                 RETURNING
+                    id_endereco,
+                    rua,
+                    numero,
+                    complemento,
+                    bairro,
+                    cidade,
+                    ponto_referencia,
+                    favorito`,
+                [
+                    rua,
+                    numero,
+                    complemento || null,
+                    bairro,
+                    cidade,
+                    ponto_referencia || null,
+                    idEndereco,
+                    req.usuario.id_usuario
+                ]
+            );
+
+            if (resultado.rows.length === 0) {
+                return res.status(404).json({
+                    mensagem: 'Endereço não encontrado.'
+                });
+            }
+
+            res.json({
+                mensagem: 'Endereço atualizado com sucesso!',
+                endereco: resultado.rows[0]
+            });
+
+        } catch (erro) {
+            console.error(erro);
+
+            res.status(500).json({
+                mensagem: 'Erro ao atualizar endereço.'
+            });
+        }
+    }
+);
+app.delete(
+    '/enderecos/:id',
+    autenticarToken,
+    verificarPerfil(3),
+    async (req, res) => {
+        try {
+            const idEndereco = req.params.id;
+
+            const resultado = await pool.query(
+                `UPDATE endereco
+                 SET ativo = FALSE,
+                     favorito = FALSE
+                 WHERE id_endereco = $1
+                   AND id_usuario = $2
+                   AND ativo = TRUE
+                 RETURNING id_endereco`,
+                [
+                    idEndereco,
+                    req.usuario.id_usuario
+                ]
+            );
+
+            if (resultado.rows.length === 0) {
+                return res.status(404).json({
+                    mensagem: 'Endereço não encontrado.'
+                });
+            }
+
+            res.json({
+                mensagem: 'Endereço removido com sucesso!'
+            });
+
+        } catch (erro) {
+            console.error(erro);
+
+            res.status(500).json({
+                mensagem: 'Erro ao remover endereço.'
+            });
+        }
+    }
+);
+app.patch(
+    '/enderecos/:id/favorito',
+    autenticarToken,
+    verificarPerfil(3),
+    async (req, res) => {
+        const cliente = await pool.connect();
+
+        try {
+            const idEndereco = req.params.id;
+
+            await cliente.query('BEGIN');
+
+            // Remove o favorito atual do cliente
+            await cliente.query(
+                `UPDATE endereco
+                 SET favorito = FALSE
+                 WHERE id_usuario = $1
+                   AND ativo = TRUE`,
+                [req.usuario.id_usuario]
+            );
+
+            // Define o novo endereço como favorito
+            const resultado = await cliente.query(
+                `UPDATE endereco
+                 SET favorito = TRUE
+                 WHERE id_endereco = $1
+                   AND id_usuario = $2
+                   AND ativo = TRUE
+                 RETURNING
+                    id_endereco,
+                    rua,
+                    numero,
+                    complemento,
+                    bairro,
+                    cidade,
+                    ponto_referencia,
+                    favorito`,
+                [
+                    idEndereco,
+                    req.usuario.id_usuario
+                ]
+            );
+
+            if (resultado.rows.length === 0) {
+                await cliente.query('ROLLBACK');
+
+                return res.status(404).json({
+                    mensagem: 'Endereço não encontrado.'
+                });
+            }
+
+            await cliente.query('COMMIT');
+
+            res.json({
+                mensagem: 'Endereço definido como favorito!',
+                endereco: resultado.rows[0]
+            });
+
+        } catch (erro) {
+            await cliente.query('ROLLBACK');
+
+            console.error(erro);
+
+            res.status(500).json({
+                mensagem: 'Erro ao definir endereço favorito.'
+            });
+
+        } finally {
+            cliente.release();
+        }
+    }
+);
+app.get(
+    '/admin/clientes',
+    autenticarToken,
+    verificarPerfil(1),
+    async (req, res) => {
+        try {
+            const resultado = await pool.query(
+                `SELECT
+                    u.id_usuario,
+                    u.nome,
+                    u.email,
+                    u.telefone,
+                    e.id_endereco,
+                    e.rua,
+                    e.numero,
+                    e.complemento,
+                    e.bairro,
+                    e.cidade,
+                    e.ponto_referencia,
+                    e.favorito
+                 FROM usuario u
+                 LEFT JOIN endereco e
+                    ON e.id_usuario = u.id_usuario
+                   AND e.ativo = TRUE
+                 WHERE u.id_perfil = 3
+                 ORDER BY u.nome, e.favorito DESC, e.id_endereco`
+            );
+
+            res.json(resultado.rows);
+
+        } catch (erro) {
+            console.error(erro);
+
+            res.status(500).json({
+                mensagem: 'Erro ao buscar clientes e endereços.'
+            });
+        }
+    }
+);
 const PORT = 3000;
 
 app.listen(PORT, () => {
