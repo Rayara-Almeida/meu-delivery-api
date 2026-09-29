@@ -2,12 +2,12 @@
 -- PostgreSQL database dump
 --
 
-\restrict IktilVMJKycKjisJjMXi6fHF5vmg4Gfcxu1Nsia1GsQvFw4VcJgNzODPykAW4pU
+\restrict Fcz0KOaPx6KyFW76Fo9ORTeSh8ubLHIoyjbmuCva4q7GpeFvknP9yW08DDwAhjQ
 
 -- Dumped from database version 18.3
 -- Dumped by pg_dump version 18.3
 
--- Started on 2026-09-28 14:42:52
+-- Started on 2026-09-29 10:42:17
 
 SET statement_timeout = 0;
 SET lock_timeout = 0;
@@ -696,6 +696,7 @@ COPY public.usuario (id_usuario, nome, email, telefone, senha, id_perfil) FROM s
 5	Loja Teste	loja.teste@email.com	87977777777	$2b$10$bYGkBXRkeCwk7poaWmKM9.JYI0b79vuhSUzkLP.LP5buQa3luOgCS	2
 6	Entregador Teste	entregador.teste@email.com	87966666666	$2b$10$jWyHoBMzDpCNEnW36W20LuaHrLaLwVJfXtb40PtL52MJSkmo2M2K2	4
 7	Cliente Teste	cliente.teste@email.com	87955555555	$2b$10$e59zZ8pJfoSNq0YFvmvRJOsUuWzeec9bXyxH0Sy.iFfVip9HUaYqO	3
+13	Cliente W06	clientew06@gmail.com	87999999999	$2b$10$/CLpOW9WfXfnpE2iiFoNE.nnNkUu.5JaYWUfP.vOwRf0fJ.E/tKvC	3
 \.
 
 
@@ -705,7 +706,7 @@ COPY public.usuario (id_usuario, nome, email, telefone, senha, id_perfil) FROM s
 -- Name: categoria_id_categoria_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
 --
 
-SELECT pg_catalog.setval('public.categoria_id_categoria_seq', 1, true);
+SELECT pg_catalog.setval('public.categoria_id_categoria_seq', 2, true);
 
 
 --
@@ -714,7 +715,7 @@ SELECT pg_catalog.setval('public.categoria_id_categoria_seq', 1, true);
 -- Name: complemento_id_complemento_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
 --
 
-SELECT pg_catalog.setval('public.complemento_id_complemento_seq', 2, true);
+SELECT pg_catalog.setval('public.complemento_id_complemento_seq', 4, true);
 
 
 --
@@ -750,7 +751,7 @@ SELECT pg_catalog.setval('public.forma_pagamento_loja_id_forma_pagamento_seq', 1
 -- Name: grupo_complemento_id_grupo_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
 --
 
-SELECT pg_catalog.setval('public.grupo_complemento_id_grupo_seq', 1, true);
+SELECT pg_catalog.setval('public.grupo_complemento_id_grupo_seq', 3, true);
 
 
 --
@@ -786,7 +787,7 @@ SELECT pg_catalog.setval('public.perfil_id_perfil_seq', 4, true);
 -- Name: produto_id_produto_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
 --
 
-SELECT pg_catalog.setval('public.produto_id_produto_seq', 1, true);
+SELECT pg_catalog.setval('public.produto_id_produto_seq', 4, true);
 
 
 --
@@ -795,7 +796,7 @@ SELECT pg_catalog.setval('public.produto_id_produto_seq', 1, true);
 -- Name: usuario_id_usuario_seq; Type: SEQUENCE SET; Schema: public; Owner: postgres
 --
 
-SELECT pg_catalog.setval('public.usuario_id_usuario_seq', 12, true);
+SELECT pg_catalog.setval('public.usuario_id_usuario_seq', 13, true);
 
 
 --
@@ -1012,11 +1013,11 @@ ALTER TABLE ONLY public.usuario
     ADD CONSTRAINT fk_usuario_perfil FOREIGN KEY (id_perfil) REFERENCES public.perfil(id_perfil);
 
 
--- Completed on 2026-09-28 14:42:53
+-- Completed on 2026-09-29 10:42:18
 
 --
 -- PostgreSQL database dump complete
 --
 
-\unrestrict IktilVMJKycKjisJjMXi6fHF5vmg4Gfcxu1Nsia1GsQvFw4VcJgNzODPykAW4pU
+\unrestrict Fcz0KOaPx6KyFW76Fo9ORTeSh8ubLHIoyjbmuCva4q7GpeFvknP9yW08DDwAhjQ
 

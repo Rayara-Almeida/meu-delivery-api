@@ -1604,6 +1604,169 @@ app.get(
         }
     }
 );
+app.post(
+    '/carrinho',
+    autenticarToken,
+    verificarPerfil(3),
+    async (req, res) => {
+        try {
+            const { id_loja, itens } = req.body;
+
+            if (!id_loja || !Array.isArray(itens) || itens.length === 0) {
+                return res.status(400).json({
+                    mensagem: 'Loja e itens do carrinho são obrigatórios.'
+                });
+            }
+
+            const carrinho = [];
+            let subtotalGeral = 0;
+
+            for (const item of itens) {
+                const {
+                    id_produto,
+                    quantidade,
+                    complementos = [],
+                    observacao
+                } = item;
+
+                if (!id_produto || !quantidade || quantidade <= 0) {
+                    return res.status(400).json({
+                        mensagem: 'Produto e quantidade válida são obrigatórios.'
+                    });
+                }
+
+                const produtoResult = await pool.query(
+                    `SELECT
+                        p.id_produto,
+                        p.nome,
+                        p.preco,
+                        p.disponivel,
+                        l.id_loja
+                     FROM produto p
+                     JOIN categoria cat
+                        ON cat.id_categoria = p.id_categoria
+                     JOIN loja l
+                        ON l.id_loja = cat.id_loja
+                     WHERE p.id_produto = $1`,
+                    [id_produto]
+                );
+
+                if (produtoResult.rows.length === 0) {
+                    return res.status(404).json({
+                        mensagem: 'Produto não encontrado.'
+                    });
+                }
+
+                const produto = produtoResult.rows[0];
+
+                if (produto.id_loja !== Number(id_loja)) {
+                    return res.status(400).json({
+                        mensagem: 'O produto pertence a outra loja.'
+                    });
+                }
+
+                if (!produto.disponivel) {
+                    return res.status(400).json({
+                        mensagem: `O produto "${produto.nome}" está indisponível.`
+                    });
+                }
+                
+                let subtotalComplementos = 0;
+                const complementosCarrinho = [];
+                const quantidadePorGrupo = {};
+
+                for (const idComplemento of complementos) {
+                const complementoResult = await pool.query(
+                `SELECT
+                    c.id_complemento,
+                    c.nome,
+                    c.preco,
+                    gc.id_grupo,
+                    gc.nome AS nome_grupo,
+                    gc.minimo_escolhas,
+                    gc.maximo_escolhas,
+                    gc.id_produto
+                    FROM complemento c
+                    JOIN grupo_complemento gc
+                    ON gc.id_grupo = c.id_grupo
+                    WHERE c.id_complemento = $1`,
+                [idComplemento]
+                );
+
+                if (complementoResult.rows.length === 0) {
+                return res.status(404).json({
+                    mensagem: 'Complemento não encontrado.'
+                });
+                }
+
+                const complemento = complementoResult.rows[0];
+
+                if (complemento.id_produto !== produto.id_produto) {
+                return res.status(400).json({
+                    mensagem: 'Complemento não pertence ao produto.'
+                });
+                }
+
+                if (!quantidadePorGrupo[complemento.id_grupo]) {
+                quantidadePorGrupo[complemento.id_grupo] = 0;
+                }
+
+                quantidadePorGrupo[complemento.id_grupo]++;
+
+                if (
+                quantidadePorGrupo[complemento.id_grupo] >
+                complemento.maximo_escolhas
+                ) {
+                return res.status(400).json({
+                    mensagem:
+                        `O grupo "${complemento.nome_grupo}" permite no máximo ` +
+                        `${complemento.maximo_escolhas} escolhas.`
+                });
+                }
+
+                subtotalComplementos += Number(complemento.preco);
+
+                complementosCarrinho.push({
+                id_complemento: complemento.id_complemento,
+                nome: complemento.nome,
+                preco: Number(complemento.preco)
+                });
+                }
+
+                const subtotalProduto =
+                    Number(produto.preco) * quantidade;
+
+                const subtotalItem =
+                    subtotalProduto + (subtotalComplementos * quantidade);
+
+                subtotalGeral += subtotalItem;
+
+                carrinho.push({
+                    id_produto: produto.id_produto,
+                    nome: produto.nome,
+                    preco_unitario: Number(produto.preco),
+                    quantidade,
+                    observacao: observacao || null,
+                    complementos: complementosCarrinho,
+                    subtotal: subtotalItem
+                });
+            }
+
+            res.json({
+                id_loja: Number(id_loja),
+                itens: carrinho,
+                subtotal: subtotalGeral
+            });
+
+        } catch (erro) {
+            console.error(erro);
+
+            res.status(500).json({
+                mensagem: 'Erro ao montar carrinho.'
+            });
+        }
+    }
+);
 const PORT = 3000;
 
 app.listen(PORT, () => {
