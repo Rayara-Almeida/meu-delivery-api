@@ -1767,8 +1767,501 @@ app.post(
         }
     }
 );
+app.post(
+    '/pedidos',
+    autenticarToken,
+    verificarPerfil(3),
+    async (req, res) => {
+        try {
+            const {
+                id_loja,
+                id_endereco,
+                itens,
+                forma_pagamento,
+                troco
+            } = req.body;
+
+            // 1. Validar dados básicos
+            if (
+                !id_loja ||
+                !id_endereco ||
+                !Array.isArray(itens) ||
+                itens.length === 0
+            ) {
+                return res.status(400).json({
+                    mensagem: 'Loja, endereço e itens são obrigatórios.'
+                });
+            }
+
+            if (!forma_pagamento) {
+                return res.status(400).json({
+                    mensagem: 'Forma de pagamento é obrigatória.'
+                });
+            }
+
+            // 2. Validar endereço do cliente
+            const enderecoResult = await pool.query(
+                `SELECT
+                    id_endereco,
+                    rua,
+                    numero,
+                    complemento,
+                    bairro,
+                    cidade,
+                    ponto_referencia
+                 FROM endereco
+                 WHERE id_endereco = $1
+                   AND id_usuario = $2
+                   AND ativo = TRUE`,
+                [id_endereco, req.usuario.id_usuario]
+            );
+
+            if (enderecoResult.rows.length === 0) {
+                return res.status(400).json({
+                    mensagem: 'Endereço inválido ou não pertence ao cliente.'
+                });
+            }
+
+            const endereco = enderecoResult.rows[0];
+
+            // 3. Validar endereço contra a área de entrega
+            const entregaResult = await pool.query(
+                `SELECT
+                    el.distancia_km,
+                    fe.id_faixa,
+                    fe.distancia_maxima_km,
+                    fe.taxa
+                 FROM endereco_loja el
+                 JOIN faixa_entrega fe
+                    ON fe.id_loja = el.id_loja
+                   AND el.distancia_km <= fe.distancia_maxima_km
+                 WHERE el.id_endereco = $1
+                   AND el.id_loja = $2
+                 ORDER BY fe.distancia_maxima_km ASC
+                 LIMIT 1`,
+                [id_endereco, id_loja]
+            );
+
+            if (entregaResult.rows.length === 0) {
+                return res.status(400).json({
+                    mensagem: 'O endereço está fora da área de entrega da loja.'
+                });
+            }
+
+            const entrega = entregaResult.rows[0];
+
+            const taxaEntrega = Number(entrega.taxa);
+
+            // 4. Verificar se a loja existe e está aberta
+            const lojaResult = await pool.query(
+                `SELECT
+                    id_loja,
+                    nome,
+                    aberta
+                 FROM loja
+                 WHERE id_loja = $1`,
+                [id_loja]
+            );
+
+            if (lojaResult.rows.length === 0) {
+                return res.status(404).json({
+                    mensagem: 'Loja não encontrada.'
+                });
+            }
+
+            const loja = lojaResult.rows[0];
+
+            if (!loja.aberta) {
+                return res.status(400).json({
+                    mensagem: 'A loja está fechada no momento.'
+                });
+            }
+
+            // 5. Verificar horário de funcionamento
+            const diasSemana = [
+                'domingo',
+                'segunda',
+                'terça',
+                'quarta',
+                'quinta',
+                'sexta',
+                'sábado'
+            ];
+
+            const agora = new Date();
+            const diaSemana = diasSemana[agora.getDay()];
+
+            const horarioResult = await pool.query(
+                `SELECT
+                    hora_abertura,
+                    hora_fechamento
+                 FROM horario_funcionamento
+                 WHERE id_loja = $1
+                   AND dia_semana = $2`,
+                [id_loja, diaSemana]
+            );
+
+            if (horarioResult.rows.length === 0) {
+                return res.status(400).json({
+                    mensagem: 'A loja não funciona hoje.'
+                });
+            }
+
+            const horaAtual = agora.toTimeString().slice(0, 8);
+
+            const dentroDoHorario = horarioResult.rows.some(horario => {
+                return (
+                    horaAtual >= horario.hora_abertura &&
+                    horaAtual <= horario.hora_fechamento
+                );
+            });
+
+            if (!dentroDoHorario) {
+                return res.status(400).json({
+                    mensagem: 'A loja está fora do horário de funcionamento.'
+                });
+            }
+
+            // 6. Validar produtos e calcular subtotal
+            const itensPedido = [];
+            let subtotalPedido = 0;
+
+            for (const item of itens) {
+                const {
+                    id_produto,
+                    quantidade,
+                    complementos = [],
+                    observacao
+                } = item;
+
+                if (
+                    !id_produto ||
+                    !quantidade ||
+                    quantidade <= 0
+                ) {
+                    return res.status(400).json({
+                        mensagem: 'Produto e quantidade válida são obrigatórios.'
+                    });
+                }
+
+                const produtoResult = await pool.query(
+                    `SELECT
+                        p.id_produto,
+                        p.nome,
+                        p.preco,
+                        p.disponivel,
+                        l.id_loja
+                     FROM produto p
+                     JOIN categoria cat
+                        ON cat.id_categoria = p.id_categoria
+                     JOIN loja l
+                        ON l.id_loja = cat.id_loja
+                     WHERE p.id_produto = $1`,
+                    [id_produto]
+                );
+
+                if (produtoResult.rows.length === 0) {
+                    return res.status(404).json({
+                        mensagem: 'Produto não encontrado.'
+                    });
+                }
+
+                const produto = produtoResult.rows[0];
+
+                if (produto.id_loja !== Number(id_loja)) {
+                    return res.status(400).json({
+                        mensagem: 'O produto pertence a outra loja.'
+                    });
+                }
+
+                if (!produto.disponivel) {
+                    return res.status(400).json({
+                        mensagem:
+                            `O produto "${produto.nome}" está indisponível.`
+                    });
+                }
+
+                // 7. Validar complementos
+                let subtotalComplementos = 0;
+                const complementosPedido = [];
+                const quantidadePorGrupo = {};
+
+                for (const idComplemento of complementos) {
+                    const complementoResult = await pool.query(
+                        `SELECT
+                            c.id_complemento,
+                            c.nome,
+                            c.preco,
+                            gc.id_grupo,
+                            gc.nome AS nome_grupo,
+                            gc.maximo_escolhas,
+                            gc.id_produto
+                         FROM complemento c
+                         JOIN grupo_complemento gc
+                            ON gc.id_grupo = c.id_grupo
+                         WHERE c.id_complemento = $1`,
+                        [idComplemento]
+                    );
+
+                    if (complementoResult.rows.length === 0) {
+                        return res.status(404).json({
+                            mensagem: 'Complemento não encontrado.'
+                        });
+                    }
+
+                    const complemento = complementoResult.rows[0];
+
+                    if (complemento.id_produto !== produto.id_produto) {
+                        return res.status(400).json({
+                            mensagem: 'Complemento não pertence ao produto.'
+                        });
+                    }
+
+                    if (!quantidadePorGrupo[complemento.id_grupo]) {
+                        quantidadePorGrupo[complemento.id_grupo] = 0;
+                    }
+
+                    quantidadePorGrupo[complemento.id_grupo]++;
+
+                    if (
+                        quantidadePorGrupo[complemento.id_grupo] >
+                        complemento.maximo_escolhas
+                    ) {
+                        return res.status(400).json({
+                            mensagem:
+                                `O grupo "${complemento.nome_grupo}" permite no máximo ` +
+                                `${complemento.maximo_escolhas} escolhas.`
+                        });
+                    }
+
+                    const precoComplemento =
+                        Number(complemento.preco);
+
+                    subtotalComplementos += precoComplemento;
+
+                    complementosPedido.push({
+                        id_complemento:
+                            complemento.id_complemento,
+                        nome_complemento:
+                            complemento.nome,
+                        preco:
+                            precoComplemento
+                    });
+                }
+
+                // 8. Calcular subtotal do item
+                const precoUnitario =
+                    Number(produto.preco);
+
+                const subtotalProduto =
+                    precoUnitario * quantidade;
+
+                const subtotalItem =
+                    subtotalProduto +
+                    (subtotalComplementos * quantidade);
+
+                itensPedido.push({
+                    id_produto:
+                        produto.id_produto,
+                    nome_produto:
+                        produto.nome,
+                    preco_unitario:
+                        precoUnitario,
+                    quantidade,
+                    observacao:
+                        observacao || null,
+                    subtotal:
+                        subtotalItem,
+                    complementos:
+                        complementosPedido
+                });
+
+                subtotalPedido += subtotalItem;
+            }
+
+            // 9. Validar forma de pagamento
+            if (
+                ![
+                    'dinheiro',
+                    'cartao_entrega',
+                    'pix'
+                ].includes(forma_pagamento)
+            ) {
+                return res.status(400).json({
+                    mensagem: 'Forma de pagamento inválida.'
+                });
+            }
+
+            if (forma_pagamento === 'dinheiro') {
+                if (
+                    troco === undefined ||
+                    troco === null ||
+                    Number(troco) < 0
+                ) {
+                    return res.status(400).json({
+                        mensagem:
+                            'Informe um valor de troco válido para pagamento em dinheiro.'
+                    });
+                }
+            } else {
+                if (
+                    troco !== undefined &&
+                    troco !== null &&
+                    Number(troco) > 0
+                ) {
+                    return res.status(400).json({
+                        mensagem:
+                            'Troco só pode ser informado para pagamento em dinheiro.'
+                    });
+                }
+            }
+
+            const trocoPedido =
+                forma_pagamento === 'dinheiro'
+                    ? Number(troco)
+                    : null;
+
+            // 10. Calcular total final
+            const totalPedido =
+                subtotalPedido + taxaEntrega;
+
+                        // 10. Salvar o pedido definitivamente no banco
+            const client = await pool.connect();
+
+            try {
+                await client.query('BEGIN');
+
+                // Criar o pedido e guardar uma cópia do endereço
+                const pedidoResult = await client.query(
+                    `INSERT INTO pedido (
+                        id_usuario,
+                        id_loja,
+                        id_endereco,
+                        rua,
+                        numero,
+                        complemento,
+                        bairro,
+                        cidade,
+                        ponto_referencia,
+                        status,
+                        subtotal,
+                        taxa_entrega,
+                        total,
+                        forma_pagamento,
+                        troco
+                    )
+                    VALUES (
+                        $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                        'aguardando_confirmacao',
+                        $10, $11, $12, $13, $14
+                    )
+                    RETURNING id_pedido`,
+                    [
+                        req.usuario.id_usuario,
+                        id_loja,
+                        id_endereco,
+                        endereco.rua,
+                        endereco.numero,
+                        endereco.complemento,
+                        endereco.bairro,
+                        endereco.cidade,
+                        endereco.ponto_referencia,
+                        subtotalPedido,
+                        taxaEntrega,
+                        totalPedido,
+                        forma_pagamento,
+                        trocoPedido
+                    ]
+                );
+
+                const idPedido = pedidoResult.rows[0].id_pedido;
+
+                // Salvar cada item do pedido
+                for (const item of itensPedido) {
+
+                    const itemResult = await client.query(
+                        `INSERT INTO pedido_item (
+                            id_pedido,
+                            id_produto,
+                            nome_produto,
+                            preco_unitario,
+                            quantidade,
+                            observacao,
+                            subtotal
+                        )
+                        VALUES ($1, $2, $3, $4, $5, $6, $7)
+                        RETURNING id_pedido_item`,
+                        [
+                            idPedido,
+                            item.id_produto,
+                            item.nome_produto,
+                            item.preco_unitario,
+                            item.quantidade,
+                            item.observacao,
+                            item.subtotal
+                        ]
+                    );
+
+                    const idPedidoItem =
+                        itemResult.rows[0].id_pedido_item;
+
+                    // Salvar os complementos daquele item
+                    for (const complemento of item.complementos) {
+                        await client.query(
+                            `INSERT INTO pedido_item_complemento (
+                                id_pedido_item,
+                                id_complemento,
+                                nome_complemento,
+                                preco
+                            )
+                            VALUES ($1, $2, $3, $4)`,
+                            [
+                                idPedidoItem,
+                                complemento.id_complemento,
+                                complemento.nome_complemento,
+                                complemento.preco
+                            ]
+                        );
+                    }
+                }
+
+                await client.query('COMMIT');
+
+                res.status(201).json({
+                    mensagem: 'Pedido criado com sucesso.',
+                    pedido: {
+                        id_pedido: idPedido,
+                        id_loja: Number(id_loja),
+                        id_endereco: Number(id_endereco),
+                        status: 'aguardando_confirmacao',
+                        subtotal: subtotalPedido,
+                        taxa_entrega: taxaEntrega,
+                        total: totalPedido,
+                        forma_pagamento,
+                        troco: trocoPedido
+                    }
+                });
+
+            } catch (erroBanco) {
+                await client.query('ROLLBACK');
+                throw erroBanco;
+
+            } finally {
+                client.release();
+            }
+
+        } catch (erro) {
+            console.error(erro);
+
+            res.status(500).json({
+                mensagem: 'Erro ao criar pedido.'
+            });
+        }
+    }
+);
+
 const PORT = 3000;
 
 app.listen(PORT, () => {
     console.log(`Servidor rodando em http://localhost:${PORT}`);
-});
+}); 
