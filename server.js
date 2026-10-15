@@ -2260,6 +2260,77 @@ app.post(
     }
 );
 
+app.post(
+    '/entrega/validar',
+    autenticarToken,
+    verificarPerfil(3),
+    async (req, res) => {
+        try {
+            const { id_loja, id_endereco } = req.body;
+
+            if (!id_loja || !id_endereco) {
+                return res.status(400).json({
+                    mensagem: 'Loja e endereço são obrigatórios.'
+                });
+            }
+
+            const enderecoResult = await pool.query(
+                `SELECT id_endereco
+                 FROM endereco
+                 WHERE id_endereco = $1
+                   AND id_usuario = $2
+                   AND ativo = TRUE`,
+                [id_endereco, req.usuario.id_usuario]
+            );
+
+            if (enderecoResult.rows.length === 0) {
+                return res.status(400).json({
+                    mensagem: 'Endereço inválido ou não pertence ao cliente.'
+                });
+            }
+
+            const entregaResult = await pool.query(
+                `SELECT
+                    el.distancia_km,
+                    fe.distancia_maxima_km,
+                    fe.taxa
+                 FROM endereco_loja el
+                 JOIN faixa_entrega fe
+                    ON fe.id_loja = el.id_loja
+                   AND el.distancia_km <= fe.distancia_maxima_km
+                 WHERE el.id_endereco = $1
+                   AND el.id_loja = $2
+                 ORDER BY fe.distancia_maxima_km ASC
+                 LIMIT 1`,
+                [id_endereco, id_loja]
+            );
+
+            if (entregaResult.rows.length === 0) {
+                return res.status(400).json({
+                    mensagem: 'O endereço está fora da área de entrega da loja.'
+                });
+            }
+
+            const entrega = entregaResult.rows[0];
+
+            return res.json({
+                mensagem: 'Endereço atendido pela loja.',
+                distancia_km: Number(entrega.distancia_km),
+                taxa_entrega: Number(entrega.taxa)
+            });
+
+        } catch (erro) {
+            console.error(erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao validar a entrega.'
+            });
+        }
+    }
+);
+
+
+
 const PORT = 3000;
 
 app.listen(PORT, () => {
