@@ -5,6 +5,64 @@ const jwt = require('jsonwebtoken');
 const autenticarToken = require('./autenticador');
 const verificarPerfil = require('./verificarPerfil');
 
+const TRANSICOES_PEDIDO = {
+    aguardando_confirmacao: [
+        'em_preparo',
+        'recusado',
+        'cancelado'
+    ],
+    em_preparo: [
+        'pronto',
+        'cancelado'
+    ],
+    pronto: [
+        'a_caminho',
+        'nao_entregue'
+    ],
+    a_caminho: [
+        'entregue',
+        'nao_entregue'
+    ],
+    entregue: [],
+    recusado: [],
+    cancelado: [],
+    nao_entregue: []
+};
+
+function perfilPodeAlterarPedido(perfil, estadoAtual, novoEstado) {
+    if (perfil === 3) {
+        // Cliente só pode cancelar antes do preparo.
+        return estadoAtual === 'aguardando_confirmacao'
+            && novoEstado === 'cancelado';
+    }
+
+    if (perfil === 2) {
+        // Loja confirma, prepara, deixa pronto ou recusa.
+        return (
+            estadoAtual === 'aguardando_confirmacao'
+            && ['em_preparo', 'recusado'].includes(novoEstado)
+        ) || (
+            estadoAtual === 'em_preparo'
+            && novoEstado === 'pronto'
+        );
+    }
+
+    if (perfil === 4) {
+        // Entregador atualiza a etapa da entrega.
+        return (
+            estadoAtual === 'pronto'
+            && novoEstado === 'a_caminho'
+        ) || (
+            estadoAtual === 'a_caminho'
+            && ['entregue', 'nao_entregue'].includes(novoEstado)
+        );
+    }
+
+    return false;
+}
+
+
+
 const app = express();
 const JWT_SECRET = 'chave-secreta-meu-delivery'
 
@@ -2175,7 +2233,17 @@ app.post(
                 );
 
                 const idPedido = pedidoResult.rows[0].id_pedido;
-
+                await client.query(
+                    `INSERT INTO historico_status_pedido
+                        (id_pedido, status_anterior, status_novo, id_usuario)
+                    VALUES ($1, $2, $3, $4)`,
+                    [
+                        idPedido,
+                        null,
+                        'aguardando_confirmacao',
+                        req.usuario.id_usuario
+                    ]
+                );
                 // Salvar cada item do pedido
                 for (const item of itensPedido) {
 
@@ -2329,10 +2397,382 @@ app.post(
     }
 );
 
+app.patch(
+    '/pedidos/:id/status',
+    autenticarToken,
+    async (req, res) => {
+        const client = await pool.connect();
+
+        try {
+            const idPedido = Number(req.params.id);
+            const { status: novoEstado, motivo } = req.body;
+            const idUsuario = req.usuario.id_usuario;
+            const perfil = Number(req.usuario.id_perfil);
+
+            if (!Number.isInteger(idPedido) || idPedido <= 0) {
+                return res.status(400).json({
+                    mensagem: 'ID do pedido inválido.'
+                });
+            }
+
+            if (
+                typeof novoEstado !== 'string' ||
+                !TRANSICOES_PEDIDO.hasOwnProperty(novoEstado)
+            ) {
+                return res.status(400).json({
+                    mensagem: 'Status informado inválido.'
+                });
+            }
+
+            const estadosComMotivo = [
+                'recusado',
+                'cancelado',
+                'nao_entregue'
+            ];
+
+            if (
+                estadosComMotivo.includes(novoEstado) &&
+                (typeof motivo !== 'string' || !motivo.trim())
+            ) {
+                return res.status(400).json({
+                    mensagem: 'Informe o motivo desta alteração.'
+                });
+            }
+
+            await client.query('BEGIN');
+
+            const pedidoResult = await client.query(
+                `SELECT id_pedido, id_usuario, id_loja, status, id_entregador
+                 FROM pedido
+                 WHERE id_pedido = $1
+                 FOR UPDATE`,
+                [idPedido]
+            );
+
+            if (pedidoResult.rows.length === 0) {
+                await client.query('ROLLBACK');
+
+                return res.status(404).json({
+                    mensagem: 'Pedido não encontrado.'
+                });
+            }
+
+            const pedido = pedidoResult.rows[0];
+            const estadoAtual = pedido.status;
+
+            if (!TRANSICOES_PEDIDO[estadoAtual]?.includes(novoEstado)) {
+                await client.query('ROLLBACK');
+
+                return res.status(400).json({
+                    mensagem: `Não é permitido mudar de ${estadoAtual} para ${novoEstado}.`
+                });
+            }
+
+            if (!perfilPodeAlterarPedido(perfil, estadoAtual, novoEstado)) {
+                await client.query('ROLLBACK');
+
+                return res.status(403).json({
+                    mensagem: 'Seu perfil não pode realizar esta alteração.'
+                });
+            }
+
+            if (perfil === 3 && Number(pedido.id_usuario) !== idUsuario) {
+                await client.query('ROLLBACK');
+
+                return res.status(403).json({
+                    mensagem: 'Você não pode alterar o pedido de outro cliente.'
+                });
+            }
+
+            if (perfil === 2) {
+                const lojaResult = await client.query(
+                    `SELECT id_loja
+                     FROM loja
+                     WHERE id_usuario = $1`,
+                    [idUsuario]
+                );
+
+                const pertenceALoja = lojaResult.rows.some(
+                    loja => Number(loja.id_loja) === Number(pedido.id_loja)
+                );
+
+                if (!pertenceALoja) {
+                    await client.query('ROLLBACK');
+
+                    return res.status(403).json({
+                        mensagem: 'Você não pode alterar pedidos de outra loja.'
+                    });
+                }
+            }
+             if (perfil === 4) {
+                if (
+                    pedido.id_entregador === null ||
+                    Number(pedido.id_entregador) !== idUsuario
+                ) {
+                    await client.query('ROLLBACK');
+
+                    return res.status(403).json({
+                        mensagem: 'Este pedido não está atribuído a você.'
+                    });
+                }
+            }
+            await client.query(
+                `UPDATE pedido
+                 SET status = $1
+                 WHERE id_pedido = $2`,
+                [novoEstado, idPedido]
+            );
+
+            await client.query(
+                `INSERT INTO historico_status_pedido
+                    (id_pedido, status_anterior, status_novo, motivo, id_usuario)
+                 VALUES ($1, $2, $3, $4, $5)`,
+                [
+                    idPedido,
+                    estadoAtual,
+                    novoEstado,
+                    motivo?.trim() || null,
+                    idUsuario
+                ]
+            );
+
+            await client.query('COMMIT');
+
+            return res.json({
+                mensagem: 'Status do pedido atualizado com sucesso.',
+                id_pedido: idPedido,
+                status_anterior: estadoAtual,
+                status_atual: novoEstado
+            });
+
+        } catch (erro) {
+            await client.query('ROLLBACK');
+            console.error(erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao atualizar o status do pedido.'
+            });
+        } finally {
+            client.release();
+        }
+    }
+);
 
 
+app.patch(
+    '/pedidos/:id/entregador',
+    autenticarToken,
+    verificarPerfil(2),
+    async (req, res) => {
+        try {
+            const idPedido = Number(req.params.id);
+            const { id_entregador } = req.body;
+
+            if (!Number.isInteger(idPedido) || idPedido <= 0) {
+                return res.status(400).json({
+                    mensagem: 'ID do pedido inválido.'
+                });
+            }
+
+            if (!Number.isInteger(Number(id_entregador)) || Number(id_entregador) <= 0) {
+                return res.status(400).json({
+                    mensagem: 'Informe um ID de entregador válido.'
+                });
+            }
+
+            const lojaResult = await pool.query(
+                `SELECT id_loja
+                 FROM loja
+                 WHERE id_usuario = $1`,
+                [req.usuario.id_usuario]
+            );
+
+            if (lojaResult.rows.length === 0) {
+                return res.status(403).json({
+                    mensagem: 'Loja não encontrada para este usuário.'
+                });
+            }
+
+            const entregadorResult = await pool.query(
+                `SELECT id_usuario
+                 FROM usuario
+                 WHERE id_usuario = $1
+                   AND id_perfil = 4`,
+                [Number(id_entregador)]
+            );
+
+            if (entregadorResult.rows.length === 0) {
+                return res.status(400).json({
+                    mensagem: 'O usuário informado não é um entregador.'
+                });
+            }
+
+            const pedidoAtual = await pool.query(
+                `SELECT id_entregador
+                FROM pedido
+                WHERE id_pedido = $1
+                AND id_loja = $2
+                AND status = 'pronto'`,
+                [
+                    idPedido,
+                    lojaResult.rows[0].id_loja
+                ]
+            );
+
+            if (pedidoAtual.rows.length === 0) {
+                return res.status(400).json({
+                    mensagem: 'Pedido não encontrado, não pertence à sua loja ou não está pronto.'
+                });
+            }
+
+            const entregadorAnterior = pedidoAtual.rows[0].id_entregador;
+
+            const pedidoResult = await pool.query(
+                `UPDATE pedido
+                SET id_entregador = $1
+                WHERE id_pedido = $2
+                AND id_loja = $3
+                AND status = 'pronto'
+                RETURNING id_pedido, id_entregador, status`,
+                [
+                    Number(id_entregador),
+                    idPedido,
+                    lojaResult.rows[0].id_loja
+                ]
+            );
+            await pool.query(
+                `INSERT INTO historico_atribuicao_entregador (
+                    id_pedido,
+                    id_entregador_anterior,
+                    id_entregador_novo,
+                    id_usuario
+                )
+                VALUES ($1, $2, $3, $4)`,
+                [
+                    idPedido,
+                    entregadorAnterior,
+                    Number(id_entregador),
+                    req.usuario.id_usuario
+                ]
+            );
+
+            if (pedidoResult.rows.length === 0) {
+                return res.status(400).json({
+                    mensagem: 'Não foi possível atribuir o entregador ao pedido.'
+                });
+            }
+
+            if (pedidoResult.rows.length === 0) {
+                return res.status(400).json({
+                    mensagem: 'Pedido não encontrado, não pertence à sua loja ou não está pronto.'
+                });
+            }
+
+            return res.json({
+                mensagem: 'Entregador atribuído com sucesso.',
+                pedido: pedidoResult.rows[0]
+            });
+
+        } catch (erro) {
+            console.error(erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao atribuir entregador ao pedido.'
+            });
+        }
+    }
+);
 const PORT = 3000;
 
+app.get(
+    '/pedidos/:id/historico',
+    autenticarToken,
+    async (req, res) => {
+        try {
+            const idPedido = Number(req.params.id);
+            const idUsuario = Number(req.usuario.id_usuario);
+            const perfil = Number(req.usuario.id_perfil);
+
+            if (!Number.isInteger(idPedido) || idPedido <= 0) {
+                return res.status(400).json({
+                    mensagem: 'ID do pedido inválido.'
+                });
+            }
+
+            const pedidoResult = await pool.query(
+                `SELECT id_pedido, id_usuario, id_loja, status
+                 FROM pedido
+                 WHERE id_pedido = $1`,
+                [idPedido]
+            );
+
+            if (pedidoResult.rows.length === 0) {
+                return res.status(404).json({
+                    mensagem: 'Pedido não encontrado.'
+                });
+            }
+
+            const pedido = pedidoResult.rows[0];
+            let autorizado = perfil === 1;
+
+            // Cliente: somente os próprios pedidos.
+            if (
+                perfil === 3 &&
+                Number(pedido.id_usuario) === idUsuario
+            ) {
+                autorizado = true;
+            }
+
+            // Loja: somente pedidos da própria loja.
+            if (perfil === 2) {
+                const lojaResult = await pool.query(
+                    `SELECT id_loja
+                     FROM loja
+                     WHERE id_usuario = $1`,
+                    [idUsuario]
+                );
+
+                autorizado = lojaResult.rows.some(
+                    loja =>
+                        Number(loja.id_loja) === Number(pedido.id_loja)
+                );
+            }
+
+            if (!autorizado) {
+                return res.status(403).json({
+                    mensagem: 'Você não tem permissão para consultar este pedido.'
+                });
+            }
+
+            const historicoResult = await pool.query(
+                `SELECT
+                    status_anterior,
+                    status_novo,
+                    motivo,
+                    data_hora,
+                    id_usuario
+                 FROM historico_status_pedido
+                 WHERE id_pedido = $1
+                 ORDER BY data_hora ASC, id_historico ASC`,
+                [idPedido]
+            );
+
+            return res.json({
+                id_pedido: pedido.id_pedido,
+                status_atual: pedido.status,
+                historico: historicoResult.rows
+            });
+
+        } catch (erro) {
+            console.error(erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao consultar o histórico do pedido.'
+            });
+        }
+    }
+);
 app.listen(PORT, () => {
     console.log(`Servidor rodando em http://localhost:${PORT}`);
 }); 
+
