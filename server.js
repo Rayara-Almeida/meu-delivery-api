@@ -2772,6 +2772,63 @@ app.get(
         }
     }
 );
+app.get(
+    '/pedidos/:id/acompanhamento',
+    autenticarToken,
+    verificarPerfil(3),
+    async (req, res) => {
+        try {
+            const idPedido = Number(req.params.id);
+            const idUsuario = Number(req.usuario.id_usuario);
+
+            if (!Number.isInteger(idPedido) || idPedido <= 0) {
+                return res.status(400).json({
+                    mensagem: 'ID do pedido inválido.'
+                });
+            }
+
+            const resultado = await pool.query(
+                `SELECT
+                    p.id_pedido,
+                    p.status,
+                    l.nome AS nome_loja,
+                    l.tempo_estimado,
+                    u.nome AS nome_entregador,
+                    (
+                        SELECT h.motivo
+                        FROM historico_status_pedido h
+                        WHERE h.id_pedido = p.id_pedido
+                          AND h.status_novo = p.status
+                        ORDER BY h.data_hora DESC, h.id_historico DESC
+                        LIMIT 1
+                    ) AS motivo
+                 FROM pedido p
+                 INNER JOIN loja l
+                    ON l.id_loja = p.id_loja
+                 LEFT JOIN usuario u
+                    ON u.id_usuario = p.id_entregador
+                 WHERE p.id_pedido = $1
+                   AND p.id_usuario = $2`,
+                [idPedido, idUsuario]
+            );
+
+            if (resultado.rows.length === 0) {
+                return res.status(404).json({
+                    mensagem: 'Pedido não encontrado.'
+                });
+            }
+
+            return res.json(resultado.rows[0]);
+
+        } catch (erro) {
+            console.error(erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao consultar acompanhamento do pedido.'
+            });
+        }
+    }
+);
 app.listen(PORT, () => {
     console.log(`Servidor rodando em http://localhost:${PORT}`);
 }); 
