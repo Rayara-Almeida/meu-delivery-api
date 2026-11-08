@@ -3029,6 +3029,170 @@ app.get(
         }
     }
 );
+
+// Cliente prepara um pedido antigo para repetir
+app.post(
+    '/cliente/pedidos/:id/repetir',
+    autenticarToken,
+    verificarPerfil(3),
+    async (req, res) => {
+        try {
+            const idPedido = Number(req.params.id);
+            const idUsuario = req.usuario.id_usuario;
+
+            if (!Number.isInteger(idPedido) || idPedido <= 0) {
+                return res.status(400).json({
+                    mensagem: 'ID do pedido inválido.'
+                });
+            }
+
+            // Verificar se o pedido pertence ao cliente
+            const pedidoResult = await pool.query(
+                `SELECT id_pedido, id_loja
+                 FROM pedido
+                 WHERE id_pedido = $1
+                   AND id_usuario = $2`,
+                [idPedido, idUsuario]
+            );
+
+            if (pedidoResult.rows.length === 0) {
+                return res.status(404).json({
+                    mensagem: 'Pedido não encontrado.'
+                });
+            }
+
+            const idLoja = pedidoResult.rows[0].id_loja;
+
+            // Buscar os itens e os preços atuais
+            const itensResult = await pool.query(
+                `SELECT
+                    pi.id_pedido_item,
+                    pi.id_produto,
+                    pi.nome_produto AS nome_antigo,
+                    pi.quantidade,
+                    pi.observacao,
+                    p.nome AS nome_atual,
+                    p.preco AS preco_atual,
+                    p.disponivel,
+                    cat.id_loja
+                 FROM pedido_item pi
+                 LEFT JOIN produto p
+                    ON p.id_produto = pi.id_produto
+                 LEFT JOIN categoria cat
+                    ON cat.id_categoria = p.id_categoria
+                 WHERE pi.id_pedido = $1
+                 ORDER BY pi.id_pedido_item`,
+                [idPedido]
+            );
+
+            const itensDisponiveis = [];
+            const itensIndisponiveis = [];
+
+            let subtotal = 0;
+
+            for (const item of itensResult.rows) {
+
+                if (
+                    !item.nome_atual ||
+                    !item.disponivel ||
+                    Number(item.id_loja) !== Number(idLoja)
+                ) {
+                    itensIndisponiveis.push({
+                        id_produto: item.id_produto,
+                        nome_produto: item.nome_antigo,
+                        quantidade: item.quantidade,
+                        motivo: 'Produto indisponível ou não pertence mais à loja.'
+                    });
+
+                    continue;
+                }
+
+                // Buscar complementos antigos
+                const complementosResult = await pool.query(
+                    `SELECT
+                        pic.id_complemento,
+                        pic.nome_complemento AS nome_antigo,
+                        pic.preco AS preco_antigo,
+                        c.nome AS nome_atual,
+                        c.preco AS preco_atual,
+                        gc.id_produto
+                     FROM pedido_item_complemento pic
+                     LEFT JOIN complemento c
+                        ON c.id_complemento = pic.id_complemento
+                     LEFT JOIN grupo_complemento gc
+                        ON gc.id_grupo = c.id_grupo
+                     WHERE pic.id_pedido_item = $1`,
+                    [item.id_pedido_item]
+                );
+
+                const complementos = [];
+                const complementosIndisponiveis = [];
+
+                for (const complemento of complementosResult.rows) {
+                    if (
+                        !complemento.nome_atual ||
+                        Number(complemento.id_produto) !== Number(item.id_produto)
+                    ) {
+                        complementosIndisponiveis.push({
+                            id_complemento: complemento.id_complemento,
+                            nome: complemento.nome_antigo,
+                            motivo: 'Complemento não está mais disponível para este produto.'
+                        });
+
+                        continue;
+                    }
+
+                    complementos.push({
+                        id_complemento: complemento.id_complemento,
+                        nome: complemento.nome_atual,
+                        preco: Number(complemento.preco_atual)
+                    });
+                }
+
+                const precoUnitario = Number(item.preco_atual);
+
+                const subtotalComplementos = complementos.reduce(
+                    (soma, complemento) => soma + complemento.preco,
+                    0
+                );
+
+                const subtotalItem =
+                    (precoUnitario + subtotalComplementos) *
+                    Number(item.quantidade);
+
+                subtotal += subtotalItem;
+
+                itensDisponiveis.push({
+                    id_produto: item.id_produto,
+                    nome: item.nome_atual,
+                    preco_unitario: precoUnitario,
+                    quantidade: item.quantidade,
+                    observacao: item.observacao,
+                    complementos,
+                    complementos_indisponiveis: complementosIndisponiveis,
+                    subtotal: subtotalItem
+                });
+            }
+
+            return res.json({
+                mensagem: 'Pedido preparado para repetição.',
+                id_pedido_original: idPedido,
+                id_loja: idLoja,
+                itens_disponiveis: itensDisponiveis,
+                itens_indisponiveis: itensIndisponiveis,
+                subtotal: Number(subtotal.toFixed(2))
+            });
+
+        } catch (erro) {
+            console.error('Erro ao repetir pedido:', erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao preparar repetição do pedido.'
+            });
+        }
+    }
+);
+
 // Loja consulta suas notificações
 app.get(
     '/loja/notificacoes',
@@ -3061,6 +3225,80 @@ app.get(
 
             return res.status(500).json({
                 mensagem: 'Erro ao consultar notificações.'
+            });
+        }
+    }
+);
+// Cliente consulta seu histórico de pedidos
+app.get(
+    '/cliente/pedidos',
+    autenticarToken,
+    verificarPerfil(3),
+    async (req, res) => {
+        try {
+            const idUsuario = req.usuario.id_usuario;
+
+            const resultado = await pool.query(
+                `SELECT
+                    p.id_pedido,
+                    historico.criado_em AS data_pedido,
+                    l.nome AS nome_loja,
+                    p.status,
+                    p.subtotal,
+                    p.taxa_entrega,
+                    p.total,
+
+                    COALESCE(
+                        (
+                            SELECT json_agg(
+                                json_build_object(
+                                    'id_pedido_item', pi.id_pedido_item,
+                                    'id_produto', pi.id_produto,
+                                    'nome_produto', pi.nome_produto,
+                                    'preco_unitario', pi.preco_unitario,
+                                    'quantidade', pi.quantidade,
+                                    'observacao', pi.observacao,
+                                    'subtotal', pi.subtotal
+                                )
+                                ORDER BY pi.id_pedido_item
+                            )
+                            FROM pedido_item pi
+                            WHERE pi.id_pedido = p.id_pedido
+                        ),
+                        '[]'::json
+                    ) AS itens
+
+                 FROM pedido p
+
+                 INNER JOIN loja l
+                    ON l.id_loja = p.id_loja
+
+                 LEFT JOIN (
+                    SELECT
+                        id_pedido,
+                        MIN(data_hora) AS criado_em
+                    FROM historico_status_pedido
+                    GROUP BY id_pedido
+                 ) historico
+                    ON historico.id_pedido = p.id_pedido
+
+                 WHERE p.id_usuario = $1
+
+                 ORDER BY historico.criado_em DESC NULLS LAST,
+                          p.id_pedido DESC`,
+                [idUsuario]
+            );
+
+            return res.json({
+                total: resultado.rows.length,
+                pedidos: resultado.rows
+            });
+
+        } catch (erro) {
+            console.error('Erro ao consultar histórico do cliente:', erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao consultar histórico de pedidos.'
             });
         }
     }
