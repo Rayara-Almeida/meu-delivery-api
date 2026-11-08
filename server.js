@@ -19,7 +19,6 @@ const TRANSICOES_PEDIDO = {
         'despachado'
     ],
     despachado: [
-        'a_caminho'
     ],
     a_caminho: [
         'entregue',
@@ -2888,6 +2887,7 @@ app.get(
                 `SELECT
                     p.id_pedido,
                     p.status,
+                    p.data_coleta,
                     l.nome AS nome_loja,
                     COALESCE(p.tempo_preparo, l.tempo_estimado) AS tempo_estimado,
                     u.nome AS nome_entregador,
@@ -2968,6 +2968,16 @@ app.get(
                     p.cidade,
                     p.ponto_referencia,
                     p.tempo_preparo,
+                    p.data_coleta,
+
+                    (
+                        SELECT h.motivo
+                        FROM historico_status_pedido h
+                        WHERE h.id_pedido = p.id_pedido
+                        AND h.status_novo = p.status
+                        ORDER BY h.data_hora DESC, h.id_historico DESC
+                        LIMIT 1
+                    ) AS motivo,
 
                     u.nome AS nome_cliente,
                     u.telefone AS telefone_cliente,
@@ -3192,7 +3202,94 @@ app.post(
         }
     }
 );
+// Cliente avalia um pedido entregue
+app.post(
+    '/cliente/pedidos/:id/avaliacao',
+    autenticarToken,
+    verificarPerfil(3),
+    async (req, res) => {
+        try {
+            const idPedido = Number(req.params.id);
+            const idUsuario = req.usuario.id_usuario;
 
+            const { nota, comentario } = req.body;
+
+            if (!Number.isInteger(idPedido) || idPedido <= 0) {
+                return res.status(400).json({
+                    mensagem: 'ID do pedido inválido.'
+                });
+            }
+
+            if (
+                !Number.isInteger(nota) ||
+                nota < 1 ||
+                nota > 5
+            ) {
+                return res.status(400).json({
+                    mensagem: 'A nota deve ser um número inteiro de 1 a 5.'
+                });
+            }
+
+            // Verificar se o pedido pertence ao cliente
+            const pedidoResult = await pool.query(
+                `SELECT id_pedido, status
+                 FROM pedido
+                 WHERE id_pedido = $1
+                   AND id_usuario = $2`,
+                [idPedido, idUsuario]
+            );
+
+            if (pedidoResult.rows.length === 0) {
+                return res.status(404).json({
+                    mensagem: 'Pedido não encontrado.'
+                });
+            }
+
+            // Somente pedidos entregues podem ser avaliados
+            if (pedidoResult.rows[0].status !== 'entregue') {
+                return res.status(400).json({
+                    mensagem: 'Somente pedidos entregues podem ser avaliados.'
+                });
+            }
+
+            // Registrar avaliação
+            const resultado = await pool.query(
+                `INSERT INTO avaliacao (
+                    id_pedido,
+                    id_usuario,
+                    nota,
+                    comentario
+                )
+                VALUES ($1, $2, $3, $4)
+                RETURNING *`,
+                [
+                    idPedido,
+                    idUsuario,
+                    nota,
+                    comentario?.trim() || null
+                ]
+            );
+
+            return res.status(201).json({
+                mensagem: 'Avaliação registrada com sucesso.',
+                avaliacao: resultado.rows[0]
+            });
+
+        } catch (erro) {
+            if (erro.code === '23505') {
+                return res.status(409).json({
+                    mensagem: 'Este pedido já possui uma avaliação.'
+                });
+            }
+
+            console.error('Erro ao registrar avaliação:', erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao registrar avaliação.'
+            });
+        }
+    }
+);
 // Loja consulta suas notificações
 app.get(
     '/loja/notificacoes',
@@ -3573,6 +3670,113 @@ app.patch(
 
             return res.status(500).json({
                 mensagem: 'Erro ao aceitar a oferta.'
+            });
+        } finally {
+            client.release();
+        }
+    }
+);
+// Entregador confirma a coleta do pedido
+app.patch(
+    '/pedidos/:id/coleta',
+    autenticarToken,
+    verificarPerfil(4),
+    async (req, res) => {
+        const client = await pool.connect();
+
+        try {
+            const idPedido = Number(req.params.id);
+            const idEntregador = req.usuario.id_usuario;
+
+            if (!Number.isInteger(idPedido) || idPedido <= 0) {
+                return res.status(400).json({
+                    mensagem: 'ID do pedido inválido.'
+                });
+            }
+
+            await client.query('BEGIN');
+
+            const pedidoResult = await client.query(
+                `SELECT id_pedido, status, id_entregador, data_coleta
+                 FROM pedido
+                 WHERE id_pedido = $1
+                 FOR UPDATE`,
+                [idPedido]
+            );
+
+            if (pedidoResult.rows.length === 0) {
+                await client.query('ROLLBACK');
+
+                return res.status(404).json({
+                    mensagem: 'Pedido não encontrado.'
+                });
+            }
+
+            const pedido = pedidoResult.rows[0];
+
+            if (
+                pedido.id_entregador === null ||
+                Number(pedido.id_entregador) !== Number(idEntregador)
+            ) {
+                await client.query('ROLLBACK');
+
+                return res.status(403).json({
+                    mensagem: 'Este pedido não está atribuído a você.'
+                });
+            }
+
+            if (pedido.status !== 'despachado') {
+                await client.query('ROLLBACK');
+
+                return res.status(400).json({
+                    mensagem: 'A coleta só pode ser confirmada em pedidos despachados.'
+                });
+            }
+
+            if (pedido.data_coleta !== null) {
+                await client.query('ROLLBACK');
+
+                return res.status(400).json({
+                    mensagem: 'A coleta deste pedido já foi confirmada.'
+                });
+            }
+
+            await client.query(
+                `UPDATE pedido
+                 SET
+                    status = 'a_caminho',
+                    data_coleta = CURRENT_TIMESTAMP
+                 WHERE id_pedido = $1`,
+                [idPedido]
+            );
+
+            await client.query(
+                `INSERT INTO historico_status_pedido (
+                    id_pedido,
+                    status_anterior,
+                    status_novo,
+                    motivo,
+                    id_usuario
+                )
+                VALUES ($1, 'despachado', 'a_caminho', NULL, $2)`,
+                [idPedido, idEntregador]
+            );
+
+            await client.query('COMMIT');
+
+            return res.json({
+                mensagem: 'Coleta confirmada! Pedido a caminho.',
+                id_pedido: idPedido,
+                status: 'a_caminho',
+                data_coleta: new Date().toISOString()
+            });
+
+        } catch (erro) {
+            await client.query('ROLLBACK');
+            console.error('Erro ao confirmar coleta:', erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao confirmar a coleta.'
             });
         } finally {
             client.release();
