@@ -16,8 +16,10 @@ const TRANSICOES_PEDIDO = {
         'cancelado'
     ],
     pronto: [
-        'a_caminho',
-        'nao_entregue'
+        'despachado'
+    ],
+    despachado: [
+        'a_caminho'
     ],
     a_caminho: [
         'entregue',
@@ -37,20 +39,23 @@ function perfilPodeAlterarPedido(perfil, estadoAtual, novoEstado) {
     }
 
     if (perfil === 2) {
-        // Loja confirma, prepara, deixa pronto ou recusa.
+        // Loja confirma, prepara, deixa pronto e despacha.
         return (
             estadoAtual === 'aguardando_confirmacao'
             && ['em_preparo', 'recusado'].includes(novoEstado)
         ) || (
             estadoAtual === 'em_preparo'
             && novoEstado === 'pronto'
+        ) || (
+            estadoAtual === 'pronto'
+            && novoEstado === 'despachado'
         );
     }
 
     if (perfil === 4) {
-        // Entregador atualiza a etapa da entrega.
+        // Entregador coleta e finaliza a entrega.
         return (
-            estadoAtual === 'pronto'
+            estadoAtual === 'despachado'
             && novoEstado === 'a_caminho'
         ) || (
             estadoAtual === 'a_caminho'
@@ -60,9 +65,6 @@ function perfilPodeAlterarPedido(perfil, estadoAtual, novoEstado) {
 
     return false;
 }
-
-
-
 const app = express();
 const JWT_SECRET = 'chave-secreta-meu-delivery'
 
@@ -2405,7 +2407,7 @@ app.patch(
 
         try {
             const idPedido = Number(req.params.id);
-            const { status: novoEstado, motivo } = req.body;
+            const { status: novoEstado, motivo, tempo_preparo } = req.body;
             const idUsuario = req.usuario.id_usuario;
             const perfil = Number(req.usuario.id_perfil);
 
@@ -2436,6 +2438,15 @@ app.patch(
             ) {
                 return res.status(400).json({
                     mensagem: 'Informe o motivo desta alteração.'
+                });
+            }
+            if (
+                perfil === 2 &&
+                novoEstado === 'em_preparo' &&
+                (!Number.isInteger(tempo_preparo) || tempo_preparo <= 0)
+            ) {
+                return res.status(400).json({
+                    mensagem: 'Informe um tempo de preparo válido em minutos.'
                 });
             }
 
@@ -2518,11 +2529,15 @@ app.patch(
             }
             await client.query(
                 `UPDATE pedido
-                 SET status = $1
-                 WHERE id_pedido = $2`,
-                [novoEstado, idPedido]
+                SET
+                    status = $1,
+                    tempo_preparo = CASE
+                        WHEN $1::varchar = 'em_preparo' THEN $2
+                        ELSE tempo_preparo
+                    END
+                WHERE id_pedido = $3`,
+                [novoEstado, novoEstado === 'em_preparo' ? tempo_preparo : null, idPedido]
             );
-
             await client.query(
                 `INSERT INTO historico_status_pedido
                     (id_pedido, status_anterior, status_novo, motivo, id_usuario)
@@ -2535,6 +2550,87 @@ app.patch(
                     idUsuario
                 ]
             );
+            let ofertaCriada = null;
+
+            if (novoEstado === 'despachado') {
+
+                // Busca um entregador online que ainda não recebeu oferta deste pedido
+                const entregadorResult = await client.query(
+                    `SELECT u.id_usuario
+                    FROM usuario u
+                    WHERE u.id_perfil = 4
+                    AND u.online = TRUE
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM oferta_entrega oe
+                        WHERE oe.id_pedido = $1
+                            AND oe.id_entregador = u.id_usuario
+                    )
+                    ORDER BY u.id_usuario
+                    LIMIT 1
+                    FOR UPDATE OF u`,
+                    [idPedido]
+                );
+
+                if (entregadorResult.rows.length > 0) {
+
+                    const idEntregador = entregadorResult.rows[0].id_usuario;
+
+                    // Busca os dados necessários para montar a oferta
+                    const dadosOferta = await client.query(
+                        `SELECT
+                            l.endereco AS origem,
+                            CONCAT_WS(', ',
+                                p.rua,
+                                p.numero,
+                                p.bairro,
+                                p.cidade
+                            ) AS destino,
+                            el.distancia_km,
+                            p.taxa_entrega AS valor_entrega
+                        FROM pedido p
+                        JOIN loja l ON l.id_loja = p.id_loja
+                        LEFT JOIN endereco_loja el
+                            ON el.id_loja = p.id_loja
+                            AND el.id_endereco = p.id_endereco
+                        WHERE p.id_pedido = $1`,
+                        [idPedido]
+                    );
+
+                    const dados = dadosOferta.rows[0];
+
+                    if (dados.distancia_km === null) {
+                        throw new Error('Distância da entrega não encontrada.');
+                    }
+
+                    const ofertaResult = await client.query(
+                        `INSERT INTO oferta_entrega (
+                            id_pedido,
+                            id_entregador,
+                            origem,
+                            destino,
+                            distancia_km,
+                            valor_entrega,
+                            prazo_resposta
+                        )
+                        VALUES (
+                            $1, $2, $3, $4, $5, $6,
+                            CURRENT_TIMESTAMP + INTERVAL '2 minutes'
+                        )
+                        RETURNING *`,
+                        [
+                            idPedido,
+                            idEntregador,
+                            dados.origem,
+                            dados.destino,
+                            dados.distancia_km,
+                            dados.valor_entrega
+                        ]
+                    );
+
+                    ofertaCriada = ofertaResult.rows[0];
+                }
+            }
 
             await client.query('COMMIT');
 
@@ -2542,7 +2638,8 @@ app.patch(
                 mensagem: 'Status do pedido atualizado com sucesso.',
                 id_pedido: idPedido,
                 status_anterior: estadoAtual,
-                status_atual: novoEstado
+                status_atual: novoEstado,
+                oferta: ofertaCriada
             });
 
         } catch (erro) {
@@ -2792,7 +2889,7 @@ app.get(
                     p.id_pedido,
                     p.status,
                     l.nome AS nome_loja,
-                    l.tempo_estimado,
+                    COALESCE(p.tempo_preparo, l.tempo_estimado) AS tempo_estimado,
                     u.nome AS nome_entregador,
                     (
                         SELECT h.motivo
@@ -2829,6 +2926,771 @@ app.get(
         }
     }
 );
+// Listar pedidos do dia da loja autenticada
+app.get(
+    '/loja/pedidos',
+    autenticarToken,
+    verificarPerfil(2),
+    async (req, res) => {
+        try {
+            const idUsuario = req.usuario.id_usuario;
+
+            // Buscar a loja do usuário autenticado
+            const lojaResult = await pool.query(
+                `SELECT id_loja
+                 FROM loja
+                 WHERE id_usuario = $1`,
+                [idUsuario]
+            );
+
+            if (lojaResult.rows.length === 0) {
+                return res.status(404).json({
+                    mensagem: 'Loja não encontrada.'
+                });
+            }
+
+            const idLoja = lojaResult.rows[0].id_loja;
+
+            // Buscar os pedidos criados hoje
+            const resultado = await pool.query(
+                `SELECT
+                    p.id_pedido,
+                    p.status,
+                    p.subtotal,
+                    p.taxa_entrega,
+                    p.total,
+                    p.forma_pagamento,
+                    p.troco,
+                    p.rua,
+                    p.numero,
+                    p.complemento,
+                    p.bairro,
+                    p.cidade,
+                    p.ponto_referencia,
+                    p.tempo_preparo,
+
+                    u.nome AS nome_cliente,
+                    u.telefone AS telefone_cliente,
+
+                    historico.criado_em,
+
+                    COALESCE(
+                        json_agg(
+                            json_build_object(
+                                'id_pedido_item', pi.id_pedido_item,
+                                'id_produto', pi.id_produto,
+                                'nome_produto', pi.nome_produto,
+                                'preco_unitario', pi.preco_unitario,
+                                'quantidade', pi.quantidade,
+                                'observacao', pi.observacao,
+                                'subtotal', pi.subtotal
+                            )
+                        ) FILTER (WHERE pi.id_pedido_item IS NOT NULL),
+                        '[]'
+                    ) AS itens
+
+                 FROM pedido p
+
+                 INNER JOIN usuario u
+                    ON u.id_usuario = p.id_usuario
+
+                 INNER JOIN (
+                    SELECT
+                        id_pedido,
+                        MIN(data_hora) AS criado_em
+                    FROM historico_status_pedido
+                    GROUP BY id_pedido
+                 ) historico
+                    ON historico.id_pedido = p.id_pedido
+
+                 LEFT JOIN pedido_item pi
+                    ON pi.id_pedido = p.id_pedido
+
+                 WHERE p.id_loja = $1
+                   AND historico.criado_em::date = CURRENT_DATE
+
+                 GROUP BY
+                    p.id_pedido,
+                    u.id_usuario,
+                    historico.criado_em
+
+                 ORDER BY historico.criado_em DESC`,
+                [idLoja]
+            );
+
+            return res.json(resultado.rows);
+
+        } catch (erro) {
+            console.error(erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao consultar pedidos da loja.'
+            });
+        }
+    }
+);
+// Loja consulta suas notificações
+app.get(
+    '/loja/notificacoes',
+    autenticarToken,
+    verificarPerfil(2),
+    async (req, res) => {
+        try {
+            const idUsuario = req.usuario.id_usuario;
+
+            const resultado = await pool.query(
+                `SELECT
+                    id_notificacao,
+                    id_pedido,
+                    mensagem,
+                    lida,
+                    data_criacao
+                 FROM notificacao
+                 WHERE id_usuario = $1
+                 ORDER BY data_criacao DESC`,
+                [idUsuario]
+            );
+
+            return res.json({
+                total: resultado.rows.length,
+                notificacoes: resultado.rows
+            });
+
+        } catch (erro) {
+            console.error('Erro ao consultar notificações da loja:', erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao consultar notificações.'
+            });
+        }
+    }
+);
+// Loja marca uma notificação como lida
+app.patch(
+    '/loja/notificacoes/:id/lida',
+    autenticarToken,
+    verificarPerfil(2),
+    async (req, res) => {
+        try {
+            const idNotificacao = req.params.id;
+            const idUsuario = req.usuario.id_usuario;
+
+            const resultado = await pool.query(
+                `UPDATE notificacao
+                 SET lida = TRUE
+                 WHERE id_notificacao = $1
+                   AND id_usuario = $2
+                 RETURNING id_notificacao, id_pedido, mensagem, lida`,
+                [idNotificacao, idUsuario]
+            );
+
+            if (resultado.rows.length === 0) {
+                return res.status(404).json({
+                    mensagem: 'Notificação não encontrada.'
+                });
+            }
+
+            return res.json({
+                mensagem: 'Notificação marcada como lida.',
+                notificacao: resultado.rows[0]
+            });
+
+        } catch (erro) {
+            console.error('Erro ao marcar notificação como lida:', erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao atualizar notificação.'
+            });
+        }
+    }
+);
+// Entregador altera seu status online/offline
+app.patch('/entregador/status', autenticarToken, verificarPerfil(4), async (req, res) => {
+    try {
+        const { online } = req.body;
+        const idUsuario = req.usuario.id_usuario;
+
+        if (typeof online !== 'boolean') {
+            return res.status(400).json({
+                mensagem: 'Informe true para online ou false para offline.'
+            });
+        }
+
+        await pool.query(
+            `UPDATE usuario
+             SET online = $1
+             WHERE id_usuario = $2`,
+            [online, idUsuario]
+        );
+
+        return res.json({
+            mensagem: online
+                ? 'Você está online e disponível para entregas.'
+                : 'Você está offline.',
+            online
+        });
+
+    } catch (erro) {
+        console.error('Erro ao alterar status do entregador:', erro);
+
+        return res.status(500).json({
+            mensagem: 'Erro ao alterar status do entregador.'
+        });
+    }
+});
+// Lista entregadores que estão online
+app.get('/entregadores/online', autenticarToken, verificarPerfil(2), async (req, res) => {
+    try {
+        const resultado = await pool.query(
+            `SELECT id_usuario, nome, telefone
+             FROM usuario
+             WHERE id_perfil = 4
+             AND online = TRUE
+             ORDER BY nome`
+        );
+
+        return res.json({
+            total: resultado.rows.length,
+            entregadores: resultado.rows
+        });
+
+    } catch (erro) {
+        console.error('Erro ao buscar entregadores online:', erro);
+
+        return res.status(500).json({
+            mensagem: 'Erro ao buscar entregadores online.'
+        });
+    }
+});
+// Entregador consulta suas ofertas pendentes
+app.get(
+    '/entregador/ofertas',
+    autenticarToken,
+    verificarPerfil(4),
+    async (req, res) => {
+        try {
+            const idEntregador = req.usuario.id_usuario;
+
+            const resultado = await pool.query(
+                `SELECT
+                    id_oferta,
+                    id_pedido,
+                    origem,
+                    destino,
+                    distancia_km,
+                    valor_entrega,
+                    prazo_resposta,
+                    status,
+                    data_criacao
+                 FROM oferta_entrega
+                 WHERE id_entregador = $1
+                   AND status = 'pendente'
+                   AND prazo_resposta > CURRENT_TIMESTAMP
+                 ORDER BY data_criacao DESC`,
+                [idEntregador]
+            );
+
+            return res.json({
+                total: resultado.rows.length,
+                ofertas: resultado.rows
+            });
+
+        } catch (erro) {
+            console.error('Erro ao consultar ofertas do entregador:', erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao consultar ofertas.'
+            });
+        }
+    }
+);
+// Entregador aceita uma oferta
+app.patch(
+    '/ofertas/:id/aceitar',
+    autenticarToken,
+    verificarPerfil(4),
+    async (req, res) => {
+        const client = await pool.connect();
+
+        try {
+            const idOferta = Number(req.params.id);
+            const idEntregador = req.usuario.id_usuario;
+
+            if (!Number.isInteger(idOferta) || idOferta <= 0) {
+                return res.status(400).json({
+                    mensagem: 'ID da oferta inválido.'
+                });
+            }
+
+            await client.query('BEGIN');
+
+            const ofertaResult = await client.query(
+                `SELECT *
+                 FROM oferta_entrega
+                 WHERE id_oferta = $1
+                 FOR UPDATE`,
+                [idOferta]
+            );
+
+            if (ofertaResult.rows.length === 0) {
+                await client.query('ROLLBACK');
+
+                return res.status(404).json({
+                    mensagem: 'Oferta não encontrada.'
+                });
+            }
+
+            const oferta = ofertaResult.rows[0];
+
+            if (Number(oferta.id_entregador) !== Number(idEntregador)) {
+                await client.query('ROLLBACK');
+
+                return res.status(403).json({
+                    mensagem: 'Esta oferta não pertence a você.'
+                });
+            }
+
+            if (oferta.status !== 'pendente') {
+                await client.query('ROLLBACK');
+
+                return res.status(400).json({
+                    mensagem: 'Esta oferta não está mais disponível.'
+                });
+            }
+
+           if (new Date(oferta.prazo_resposta) <= new Date()) {
+                await client.query('ROLLBACK');
+
+                return res.status(400).json({
+                    mensagem: 'O prazo desta oferta expirou. Aguarde a próxima oferta.'
+                });
+            }
+
+            const pedidoResult = await client.query(
+                `SELECT id_entregador, status
+                 FROM pedido
+                 WHERE id_pedido = $1
+                 FOR UPDATE`,
+                [oferta.id_pedido]
+            );
+
+            if (
+                pedidoResult.rows.length === 0 ||
+                pedidoResult.rows[0].status !== 'despachado' ||
+                pedidoResult.rows[0].id_entregador !== null
+            ) {
+                await client.query('ROLLBACK');
+
+                return res.status(400).json({
+                    mensagem: 'Este pedido não está disponível para atribuição.'
+                });
+            }
+
+            await client.query(
+                `UPDATE oferta_entrega
+                 SET status = 'aceita'
+                 WHERE id_oferta = $1`,
+                [idOferta]
+            );
+
+            await client.query(
+                `UPDATE pedido
+                 SET id_entregador = $1
+                 WHERE id_pedido = $2`,
+                [idEntregador, oferta.id_pedido]
+            );
+
+            await client.query(
+                `INSERT INTO historico_atribuicao_entregador (
+                    id_pedido,
+                    id_entregador_anterior,
+                    id_entregador_novo,
+                    id_usuario
+                )
+                VALUES ($1, NULL, $2, $2)`,
+                [oferta.id_pedido, idEntregador]
+            );
+
+            await client.query(
+                `UPDATE oferta_entrega
+                 SET status = 'expirada'
+                 WHERE id_pedido = $1
+                   AND id_oferta <> $2
+                   AND status = 'pendente'`,
+                [oferta.id_pedido, idOferta]
+            );
+
+            await client.query('COMMIT');
+
+            return res.json({
+                mensagem: 'Oferta aceita! Entrega atribuída a você.',
+                id_oferta: idOferta,
+                id_pedido: oferta.id_pedido,
+                id_entregador: idEntregador
+            });
+
+        } catch (erro) {
+            await client.query('ROLLBACK');
+            console.error('Erro ao aceitar oferta:', erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao aceitar a oferta.'
+            });
+        } finally {
+            client.release();
+        }
+    }
+);
+// Entregador recusa uma oferta
+app.patch(
+    '/ofertas/:id/recusar',
+    autenticarToken,
+    verificarPerfil(4),
+    async (req, res) => {
+        const client = await pool.connect();
+
+        try {
+            const idOferta = Number(req.params.id);
+            const idEntregador = req.usuario.id_usuario;
+
+            if (!Number.isInteger(idOferta) || idOferta <= 0) {
+                return res.status(400).json({
+                    mensagem: 'ID da oferta inválido.'
+                });
+            }
+
+            await client.query('BEGIN');
+
+            const ofertaResult = await client.query(
+                `SELECT *
+                 FROM oferta_entrega
+                 WHERE id_oferta = $1
+                 FOR UPDATE`,
+                [idOferta]
+            );
+
+            if (ofertaResult.rows.length === 0) {
+                await client.query('ROLLBACK');
+
+                return res.status(404).json({
+                    mensagem: 'Oferta não encontrada.'
+                });
+            }
+
+            const oferta = ofertaResult.rows[0];
+
+            if (Number(oferta.id_entregador) !== Number(idEntregador)) {
+                await client.query('ROLLBACK');
+
+                return res.status(403).json({
+                    mensagem: 'Esta oferta não pertence a você.'
+                });
+            }
+
+            if (oferta.status !== 'pendente') {
+                await client.query('ROLLBACK');
+
+                return res.status(400).json({
+                    mensagem: 'Esta oferta não está mais disponível.'
+                });
+            }
+
+            if (new Date(oferta.prazo_resposta) <= new Date()) {
+                await client.query('ROLLBACK');
+
+                return res.status(400).json({
+                    mensagem: 'O prazo desta oferta expirou. Aguarde a próxima oferta.'
+                });
+            }
+
+            // 1. Marca a oferta atual como recusada
+            await client.query(
+                `UPDATE oferta_entrega
+                SET status = 'recusada'
+                WHERE id_oferta = $1`,
+                [idOferta]
+            );
+
+            // 2. Busca outro entregador online que ainda não recebeu oferta
+            const proximoEntregador = await client.query(
+                `SELECT u.id_usuario
+                FROM usuario u
+                WHERE u.id_perfil = 4
+                AND u.online = TRUE
+                AND u.id_usuario <> $2
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM oferta_entrega oe
+                    WHERE oe.id_pedido = $1
+                        AND oe.id_entregador = u.id_usuario
+                )
+                ORDER BY u.id_usuario
+                LIMIT 1
+                FOR UPDATE OF u`,
+                [oferta.id_pedido, idEntregador]
+            );
+
+            let novaOferta = null;
+
+            // 3. Se encontrou outro entregador, cria uma nova oferta
+            if (proximoEntregador.rows.length > 0) {
+                const novoIdEntregador = proximoEntregador.rows[0].id_usuario;
+
+                const dadosOferta = await client.query(
+                    `SELECT
+                        l.endereco AS origem,
+                        CONCAT_WS(', ',
+                            p.rua,
+                            p.numero,
+                            p.bairro,
+                            p.cidade
+                        ) AS destino,
+                        el.distancia_km,
+                        p.taxa_entrega AS valor_entrega
+                    FROM pedido p
+                    JOIN loja l ON l.id_loja = p.id_loja
+                    LEFT JOIN endereco_loja el
+                        ON el.id_loja = p.id_loja
+                        AND el.id_endereco = p.id_endereco
+                    WHERE p.id_pedido = $1`,
+                    [oferta.id_pedido]
+                );
+
+                const dados = dadosOferta.rows[0];
+
+                if (!dados || dados.distancia_km === null) {
+                    throw new Error('Dados da entrega não encontrados.');
+                }
+
+                const resultadoNovaOferta = await client.query(
+                    `INSERT INTO oferta_entrega (
+                        id_pedido,
+                        id_entregador,
+                        origem,
+                        destino,
+                        distancia_km,
+                        valor_entrega,
+                        prazo_resposta
+                    )
+                    VALUES (
+                        $1, $2, $3, $4, $5, $6,
+                        CURRENT_TIMESTAMP + INTERVAL '2 minutes'
+                    )
+                    RETURNING *`,
+                    [
+                        oferta.id_pedido,
+                        novoIdEntregador,
+                        dados.origem,
+                        dados.destino,
+                        dados.distancia_km,
+                        dados.valor_entrega
+                    ]
+                );
+
+                novaOferta = resultadoNovaOferta.rows[0];
+            }
+
+            // 4. Confirma as alterações
+            await client.query('COMMIT');
+
+            return res.json({
+                mensagem: 'Oferta recusada com sucesso.',
+                id_oferta: idOferta,
+                id_pedido: oferta.id_pedido,
+                nova_oferta: novaOferta
+            });
+
+        } catch (erro) {
+            await client.query('ROLLBACK');
+            console.error('Erro ao recusar oferta:', erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao recusar a oferta.'
+            });
+        } finally {
+            client.release();
+        }
+    }
+);
+// Verifica ofertas vencidas e envia para o próximo entregador
+async function processarOfertasExpiradas() {
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        // 1. Busca uma oferta pendente cujo prazo terminou
+        const ofertaResult = await client.query(
+            `SELECT *
+             FROM oferta_entrega
+             WHERE status = 'pendente'
+               AND prazo_resposta <= CURRENT_TIMESTAMP
+             ORDER BY prazo_resposta
+             LIMIT 1
+             FOR UPDATE SKIP LOCKED`
+        );
+
+        if (ofertaResult.rows.length === 0) {
+            await client.query('COMMIT');
+            return;
+        }
+
+        const oferta = ofertaResult.rows[0];
+
+        // 2. Marca a oferta como expirada
+        await client.query(
+            `UPDATE oferta_entrega
+             SET status = 'expirada'
+             WHERE id_oferta = $1`,
+            [oferta.id_oferta]
+        );
+
+        // 3. Verifica se o pedido ainda precisa de entregador
+        const pedidoResult = await client.query(
+            `SELECT id_entregador, status
+             FROM pedido
+             WHERE id_pedido = $1
+             FOR UPDATE`,
+            [oferta.id_pedido]
+        );
+
+        if (
+            pedidoResult.rows.length === 0 ||
+            pedidoResult.rows[0].status !== 'despachado' ||
+            pedidoResult.rows[0].id_entregador !== null
+        ) {
+            await client.query('COMMIT');
+            return;
+        }
+
+        // 4. Procura outro entregador online
+        const proximoEntregador = await client.query(
+            `SELECT u.id_usuario
+             FROM usuario u
+             WHERE u.id_perfil = 4
+               AND u.online = TRUE
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM oferta_entrega oe
+                   WHERE oe.id_pedido = $1
+                     AND oe.id_entregador = u.id_usuario
+               )
+             ORDER BY u.id_usuario
+             LIMIT 1
+             FOR UPDATE OF u`,
+            [oferta.id_pedido]
+        );
+
+        if (proximoEntregador.rows.length === 0) {
+
+            // Busca o usuário responsável pela loja do pedido
+            const lojaResult = await client.query(
+                `SELECT l.id_usuario
+                FROM loja l
+                JOIN pedido p ON p.id_loja = l.id_loja
+                WHERE p.id_pedido = $1`,
+                [oferta.id_pedido]
+            );
+
+            // Registra a notificação para a loja
+            if (lojaResult.rows.length > 0) {
+                await client.query(
+                    `INSERT INTO notificacao (
+                        id_usuario,
+                        id_pedido,
+                        mensagem
+                    )
+                    VALUES ($1, $2, $3)`,
+                    [
+                        lojaResult.rows[0].id_usuario,
+                        oferta.id_pedido,
+                        'Não há entregadores online disponíveis para este pedido.'
+                    ]
+                );
+            }
+
+            await client.query('COMMIT');
+
+            console.log(
+                `Pedido ${oferta.id_pedido}: loja notificada sobre a falta de entregadores.`
+            );
+
+            return;
+        }
+
+        // 5. Busca os dados da entrega
+        const dadosOferta = await client.query(
+            `SELECT
+                l.endereco AS origem,
+                CONCAT_WS(', ',
+                    p.rua,
+                    p.numero,
+                    p.bairro,
+                    p.cidade
+                ) AS destino,
+                el.distancia_km,
+                p.taxa_entrega AS valor_entrega
+             FROM pedido p
+             JOIN loja l ON l.id_loja = p.id_loja
+             LEFT JOIN endereco_loja el
+                ON el.id_loja = p.id_loja
+                AND el.id_endereco = p.id_endereco
+             WHERE p.id_pedido = $1`,
+            [oferta.id_pedido]
+        );
+
+        const dados = dadosOferta.rows[0];
+
+        if (!dados || dados.distancia_km === null) {
+            await client.query('COMMIT');
+            console.error(
+                `Não foi possível obter os dados da entrega do pedido ${oferta.id_pedido}.`
+            );
+            return;
+        }
+
+        // 6. Cria a próxima oferta com prazo de dois minutos
+        const resultadoNovaOferta = await client.query(
+            `INSERT INTO oferta_entrega (
+                id_pedido,
+                id_entregador,
+                origem,
+                destino,
+                distancia_km,
+                valor_entrega,
+                prazo_resposta
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6,
+                CURRENT_TIMESTAMP + INTERVAL '2 minutes'
+            )
+            RETURNING *`,
+            [
+                oferta.id_pedido,
+                proximoEntregador.rows[0].id_usuario,
+                dados.origem,
+                dados.destino,
+                dados.distancia_km,
+                dados.valor_entrega
+            ]
+        );
+
+        await client.query('COMMIT');
+
+        console.log(
+            `Nova oferta ${resultadoNovaOferta.rows[0].id_oferta} criada para o entregador ${resultadoNovaOferta.rows[0].id_entregador}.`
+        );
+
+    } catch (erro) {
+        await client.query('ROLLBACK');
+        console.error('Erro ao processar ofertas expiradas:', erro);
+    } finally {
+        client.release();
+    }
+}
+
+// Executa a verificação a cada 5 segundos
+setInterval(processarOfertasExpiradas, 5000);
 app.listen(PORT, () => {
     console.log(`Servidor rodando em http://localhost:${PORT}`);
 }); 
