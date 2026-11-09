@@ -328,6 +328,16 @@ app.get('/lojas', async (req, res) => {
                 l.tempo_estimado,
                 l.taxa,
                 l.aberta,
+
+                (
+                    SELECT ROUND(AVG(a.nota)::numeric, 2)
+                    FROM avaliacao a
+                    INNER JOIN pedido p
+                        ON p.id_pedido = a.id_pedido
+                    WHERE p.id_loja = l.id_loja
+                    AND a.tipo = 'loja'
+                ) AS media_avaliacoes,
+
                 h.hora_abertura,
                 h.hora_fechamento
             FROM loja l
@@ -371,7 +381,10 @@ app.get('/lojas', async (req, res) => {
                 categoria: loja.categoria,
                 tempo_estimado: loja.tempo_estimado,
                 taxa: loja.taxa,
-                aberta: estaAberta
+                aberta: estaAberta,
+                media_avaliacoes: loja.media_avaliacoes === null
+                    ? null
+                    : Number(loja.media_avaliacoes)
             };
         });
 
@@ -3693,6 +3706,32 @@ app.get(
                     p.subtotal,
                     p.taxa_entrega,
                     p.total,
+                    (
+                        SELECT json_build_object(
+                            'id_avaliacao', a.id_avaliacao,
+                            'nota', a.nota,
+                            'comentario', a.comentario,
+                            'data_avaliacao', a.data_avaliacao
+                        )
+                        FROM avaliacao a
+                        WHERE a.id_pedido = p.id_pedido
+                        AND a.id_usuario = p.id_usuario
+                        AND a.tipo = 'loja'
+                    ) AS avaliacao_loja,
+
+                    (
+                        SELECT json_build_object(
+                            'id_avaliacao', a.id_avaliacao,
+                            'nota', a.nota,
+                            'comentario', a.comentario,
+                            'data_avaliacao', a.data_avaliacao
+                        )
+                        FROM avaliacao a
+                        WHERE a.id_pedido = p.id_pedido
+                        AND a.id_usuario = p.id_usuario
+                        AND a.tipo = 'entregador'
+                    ) AS avaliacao_entregador,
+
 
                     COALESCE(
                         (
