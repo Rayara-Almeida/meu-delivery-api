@@ -37,6 +37,7 @@ CREATE TABLE public.avaliacao (
     nota integer NOT NULL,
     comentario text,
     data_avaliacao timestamp without time zone DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    tipo character varying(15),
     CONSTRAINT avaliacao_nota_check CHECK (((nota >= 1) AND (nota <= 5)))
 );
 
@@ -1062,7 +1063,12 @@ ALTER TABLE ONLY public.usuario ALTER COLUMN id_usuario SET DEFAULT nextval('pub
 COPY public.avaliacao (id_avaliacao, id_pedido, id_usuario, nota, comentario, data_avaliacao) FROM stdin;
 1	2	13	5	Pedido muito bom!	2026-11-08 19:40:27.081337
 \.
+UPDATE public.avaliacao
+SET tipo = 'loja'
+WHERE tipo IS NULL;
 
+ALTER TABLE ONLY public.avaliacao
+    ALTER COLUMN tipo SET NOT NULL;
 
 --
 -- TOC entry 5243 (class 0 OID 17899)
@@ -1547,8 +1553,12 @@ SELECT pg_catalog.setval('public.usuario_id_usuario_seq', 14, true);
 --
 
 ALTER TABLE ONLY public.avaliacao
-    ADD CONSTRAINT avaliacao_id_pedido_key UNIQUE (id_pedido);
+    ADD CONSTRAINT avaliacao_tipo_check CHECK (
+        tipo IN ('loja', 'entregador')
+    );
 
+ALTER TABLE ONLY public.avaliacao
+    ADD CONSTRAINT avaliacao_pedido_tipo_key UNIQUE (id_pedido, tipo);
 
 --
 -- TOC entry 5050 (class 2606 OID 26301)

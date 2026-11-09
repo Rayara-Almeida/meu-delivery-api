@@ -3203,6 +3203,7 @@ app.post(
     }
 );
 // Cliente avalia um pedido entregue
+// Cliente avalia a loja ou o entregador de um pedido
 app.post(
     '/cliente/pedidos/:id/avaliacao',
     autenticarToken,
@@ -3212,11 +3213,17 @@ app.post(
             const idPedido = Number(req.params.id);
             const idUsuario = req.usuario.id_usuario;
 
-            const { nota, comentario } = req.body;
+            const { tipo, nota, comentario } = req.body;
 
             if (!Number.isInteger(idPedido) || idPedido <= 0) {
                 return res.status(400).json({
                     mensagem: 'ID do pedido inválido.'
+                });
+            }
+
+            if (!['loja', 'entregador'].includes(tipo)) {
+                return res.status(400).json({
+                    mensagem: 'O tipo deve ser loja ou entregador.'
                 });
             }
 
@@ -3230,9 +3237,19 @@ app.post(
                 });
             }
 
+            if (
+                comentario !== undefined &&
+                comentario !== null &&
+                typeof comentario !== 'string'
+            ) {
+                return res.status(400).json({
+                    mensagem: 'O comentário deve ser um texto.'
+                });
+            }
+
             // Verificar se o pedido pertence ao cliente
             const pedidoResult = await pool.query(
-                `SELECT id_pedido, status
+                `SELECT id_pedido, status, id_entregador
                  FROM pedido
                  WHERE id_pedido = $1
                    AND id_usuario = $2`,
@@ -3245,10 +3262,19 @@ app.post(
                 });
             }
 
+            const pedido = pedidoResult.rows[0];
+
             // Somente pedidos entregues podem ser avaliados
-            if (pedidoResult.rows[0].status !== 'entregue') {
+            if (pedido.status !== 'entregue') {
                 return res.status(400).json({
                     mensagem: 'Somente pedidos entregues podem ser avaliados.'
+                });
+            }
+
+            // Verificar se existe entregador para avaliar
+            if (tipo === 'entregador' && !pedido.id_entregador) {
+                return res.status(400).json({
+                    mensagem: 'Este pedido não possui entregador associado.'
                 });
             }
 
@@ -3257,14 +3283,16 @@ app.post(
                 `INSERT INTO avaliacao (
                     id_pedido,
                     id_usuario,
+                    tipo,
                     nota,
                     comentario
                 )
-                VALUES ($1, $2, $3, $4)
+                VALUES ($1, $2, $3, $4, $5)
                 RETURNING *`,
                 [
                     idPedido,
                     idUsuario,
+                    tipo,
                     nota,
                     comentario?.trim() || null
                 ]
@@ -3278,7 +3306,7 @@ app.post(
         } catch (erro) {
             if (erro.code === '23505') {
                 return res.status(409).json({
-                    mensagem: 'Este pedido já possui uma avaliação.'
+                    mensagem: 'Este pedido já possui uma avaliação deste tipo.'
                 });
             }
 
@@ -3286,6 +3314,327 @@ app.post(
 
             return res.status(500).json({
                 mensagem: 'Erro ao registrar avaliação.'
+            });
+        }
+    }
+);
+// Loja consulta suas avaliações e médias
+app.get(
+    '/loja/avaliacoes',
+    autenticarToken,
+    verificarPerfil(2),
+    async (req, res) => {
+        try {
+            const idUsuario = req.usuario.id_usuario;
+
+            // Buscar a loja do usuário autenticado
+            const lojaResult = await pool.query(
+                `SELECT id_loja
+                 FROM loja
+                 WHERE id_usuario = $1`,
+                [idUsuario]
+            );
+
+            if (lojaResult.rows.length === 0) {
+                return res.status(404).json({
+                    mensagem: 'Loja não encontrada.'
+                });
+            }
+
+            const idLoja = lojaResult.rows[0].id_loja;
+
+            // Buscar as médias das avaliações da loja e dos entregadores
+            const mediasResult = await pool.query(
+                `SELECT
+                    AVG(a.nota) FILTER (
+                        WHERE a.tipo = 'loja'
+                    ) AS media_loja,
+
+                    AVG(a.nota) FILTER (
+                        WHERE a.tipo = 'entregador'
+                    ) AS media_entregadores,
+
+                    COUNT(*) AS total_avaliacoes
+
+                 FROM avaliacao a
+                 INNER JOIN pedido p
+                    ON p.id_pedido = a.id_pedido
+                 WHERE p.id_loja = $1`,
+                [idLoja]
+            );
+
+            // Buscar as avaliações detalhadas
+            const avaliacoesResult = await pool.query(
+                `SELECT
+                    a.id_avaliacao,
+                    a.id_pedido,
+                    a.tipo,
+                    a.nota,
+                    a.comentario,
+                    a.data_avaliacao,
+                    cliente.nome AS nome_cliente,
+                    entregador.nome AS nome_entregador
+
+                 FROM avaliacao a
+
+                 INNER JOIN pedido p
+                    ON p.id_pedido = a.id_pedido
+
+                 INNER JOIN usuario cliente
+                    ON cliente.id_usuario = a.id_usuario
+
+                 LEFT JOIN usuario entregador
+                    ON entregador.id_usuario = p.id_entregador
+
+                 WHERE p.id_loja = $1
+                 ORDER BY a.data_avaliacao DESC`,
+                [idLoja]
+            );
+
+            const medias = mediasResult.rows[0];
+
+            return res.json({
+                media_loja: medias.media_loja === null
+                    ? null
+                    : Number(Number(medias.media_loja).toFixed(2)),
+
+                media_entregadores: medias.media_entregadores === null
+                    ? null
+                    : Number(Number(medias.media_entregadores).toFixed(2)),
+
+                total_avaliacoes: Number(medias.total_avaliacoes),
+
+                avaliacoes: avaliacoesResult.rows
+            });
+
+        } catch (erro) {
+            console.error('Erro ao consultar avaliações:', erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao consultar avaliações da loja.'
+            });
+        }
+    }
+);
+// Loja consulta relatório de desempenho por período
+app.get(
+    '/loja/relatorio',
+    autenticarToken,
+    verificarPerfil(2),
+    async (req, res) => {
+        try {
+            const idUsuario = req.usuario.id_usuario;
+
+            const { data_inicio, data_fim } = req.query;
+
+            // Validar formato e existência das datas
+            const dataValida = (data) => {
+                if (
+                    typeof data !== 'string' ||
+                    !/^\d{4}-\d{2}-\d{2}$/.test(data)
+                ) {
+                    return false;
+                }
+
+                const dataConvertida = new Date(`${data}T00:00:00Z`);
+
+                return (
+                    !Number.isNaN(dataConvertida.getTime()) &&
+                    dataConvertida.toISOString().slice(0, 10) === data
+                );
+            };
+
+            if (!dataValida(data_inicio) || !dataValida(data_fim)) {
+                return res.status(400).json({
+                    mensagem: 'Informe data_inicio e data_fim no formato AAAA-MM-DD.'
+                });
+            }
+
+            if (data_inicio > data_fim) {
+                return res.status(400).json({
+                    mensagem: 'A data inicial não pode ser maior que a data final.'
+                });
+            }
+
+            // Buscar a loja do usuário autenticado
+            const lojaResult = await pool.query(
+                `SELECT id_loja
+                 FROM loja
+                 WHERE id_usuario = $1`,
+                [idUsuario]
+            );
+
+            if (lojaResult.rows.length === 0) {
+                return res.status(404).json({
+                    mensagem: 'Loja não encontrada.'
+                });
+            }
+
+            const idLoja = lojaResult.rows[0].id_loja;
+
+            // Calcular indicadores dos pedidos no período
+            const relatorioResult = await pool.query(
+                `WITH pedidos_periodo AS (
+                    SELECT
+                        p.id_pedido,
+                        p.status,
+                        p.subtotal
+                    FROM pedido p
+                    INNER JOIN (
+                        SELECT
+                            id_pedido,
+                            MIN(data_hora) AS criado_em
+                        FROM historico_status_pedido
+                        GROUP BY id_pedido
+                    ) h
+                        ON h.id_pedido = p.id_pedido
+                    WHERE p.id_loja = $1
+                      AND h.criado_em >= $2::date
+                      AND h.criado_em < ($3::date + INTERVAL '1 day')
+                ),
+
+                preparo_por_pedido AS (
+                    SELECT
+                        h.id_pedido,
+
+                        EXTRACT(
+                            EPOCH FROM (
+                                MIN(h.data_hora) FILTER (
+                                    WHERE h.status_novo = 'pronto'
+                                )
+                                -
+                                MIN(h.data_hora) FILTER (
+                                    WHERE h.status_novo = 'em_preparo'
+                                )
+                            )
+                        ) / 60 AS tempo_minutos
+
+                    FROM historico_status_pedido h
+
+                    INNER JOIN pedidos_periodo pp
+                        ON pp.id_pedido = h.id_pedido
+
+                    GROUP BY h.id_pedido
+                )
+
+                SELECT
+                    COUNT(*)::integer AS total_pedidos,
+
+                    COALESCE(
+                        SUM(subtotal) FILTER (
+                            WHERE status = 'entregue'
+                        ),
+                        0
+                    ) AS faturamento,
+
+                    COUNT(*) FILTER (
+                        WHERE status = 'recusado'
+                    )::integer AS pedidos_recusados,
+
+                    CASE
+                        WHEN COUNT(*) = 0 THEN 0
+                        ELSE ROUND(
+                            (
+                                COUNT(*) FILTER (
+                                    WHERE status = 'recusado'
+                                )::numeric
+                                / COUNT(*)::numeric
+                            ) * 100,
+                            2
+                        )
+                    END AS taxa_recusa,
+
+                    (
+                        SELECT ROUND(AVG(tempo_minutos)::numeric, 2)
+                        FROM preparo_por_pedido
+                        WHERE tempo_minutos >= 0
+                    ) AS tempo_medio_preparo,
+
+                    (
+                        SELECT ROUND(
+                            AVG(a.nota) FILTER (
+                                WHERE a.tipo = 'loja'
+                            )::numeric,
+                            2
+                        )
+                        FROM avaliacao a
+                        INNER JOIN pedidos_periodo pp
+                            ON pp.id_pedido = a.id_pedido
+                    ) AS media_loja,
+
+                    (
+                        SELECT ROUND(
+                            AVG(a.nota) FILTER (
+                                WHERE a.tipo = 'entregador'
+                            )::numeric,
+                            2
+                        )
+                        FROM avaliacao a
+                        INNER JOIN pedidos_periodo pp
+                            ON pp.id_pedido = a.id_pedido
+                    ) AS media_entregadores
+
+                FROM pedidos_periodo`,
+                [idLoja, data_inicio, data_fim]
+            );
+
+            // Buscar os cinco produtos mais vendidos
+            const produtosResult = await pool.query(
+                `WITH pedidos_periodo AS (
+                    SELECT
+                        p.id_pedido
+                    FROM pedido p
+                    INNER JOIN (
+                        SELECT
+                            id_pedido,
+                            MIN(data_hora) AS criado_em
+                        FROM historico_status_pedido
+                        GROUP BY id_pedido
+                    ) h
+                        ON h.id_pedido = p.id_pedido
+                    WHERE p.id_loja = $1
+                      AND p.status = 'entregue'
+                      AND h.criado_em >= $2::date
+                      AND h.criado_em < ($3::date + INTERVAL '1 day')
+                )
+
+                SELECT
+                    pi.id_produto,
+                    pi.nome_produto,
+                    SUM(pi.quantidade)::integer AS quantidade_vendida,
+                    SUM(pi.subtotal) AS valor_vendido
+
+                FROM pedido_item pi
+
+                INNER JOIN pedidos_periodo pp
+                    ON pp.id_pedido = pi.id_pedido
+
+                GROUP BY
+                    pi.id_produto,
+                    pi.nome_produto
+
+                ORDER BY
+                    quantidade_vendida DESC,
+                    valor_vendido DESC
+
+                LIMIT 5`,
+                [idLoja, data_inicio, data_fim]
+            );
+
+            return res.json({
+                periodo: {
+                    data_inicio,
+                    data_fim
+                },
+                indicadores: relatorioResult.rows[0],
+                produtos_mais_vendidos: produtosResult.rows
+            });
+
+        } catch (erro) {
+            console.error('Erro ao consultar relatório da loja:', erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao consultar relatório da loja.'
             });
         }
     }
