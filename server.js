@@ -3497,6 +3497,173 @@ app.get('/entregadores/online', autenticarToken, verificarPerfil(2), async (req,
         });
     }
 });
+// Entregador consulta seus ganhos do dia
+app.get(
+    '/entregador/ganhos',
+    autenticarToken,
+    verificarPerfil(4),
+    async (req, res) => {
+        try {
+            const idEntregador = req.usuario.id_usuario;
+
+            const resultado = await pool.query(
+                `SELECT
+                    p.id_pedido,
+                    l.nome AS nome_loja,
+                    p.cidade,
+                    p.bairro,
+                    h.data_hora AS data_entrega,
+                    COALESCE(
+                        (
+                            SELECT oe.valor_entrega
+                            FROM oferta_entrega oe
+                            WHERE oe.id_pedido = p.id_pedido
+                              AND oe.id_entregador = $1
+                              AND oe.status = 'aceita'
+                            ORDER BY oe.data_criacao DESC
+                            LIMIT 1
+                        ),
+                        0
+                    ) AS valor_entrega
+                 FROM pedido p
+                 INNER JOIN loja l
+                    ON l.id_loja = p.id_loja
+                 INNER JOIN LATERAL (
+                    SELECT data_hora
+                    FROM historico_status_pedido
+                    WHERE id_pedido = p.id_pedido
+                      AND status_novo = 'entregue'
+                    ORDER BY data_hora DESC
+                    LIMIT 1
+                 ) h ON true
+                 WHERE p.id_entregador = $1
+                   AND p.status = 'entregue'
+                   AND h.data_hora::date = CURRENT_DATE
+                 ORDER BY h.data_hora DESC`,
+                [idEntregador]
+            );
+
+            const entregas = resultado.rows;
+
+            const totalGanhos = entregas.reduce(
+                (total, entrega) =>
+                    total + Number(entrega.valor_entrega),
+                0
+            );
+
+            return res.json({
+                quantidade_entregas: entregas.length,
+                total_ganhos: Number(totalGanhos.toFixed(2)),
+                entregas
+            });
+
+        } catch (erro) {
+            console.error('Erro ao consultar ganhos:', erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao consultar ganhos do entregador.'
+            });
+        }
+    }
+);
+// Entregador consulta sua entrega atual
+app.get(
+    '/entregador/entrega-atual',
+    autenticarToken,
+    verificarPerfil(4),
+    async (req, res) => {
+        try {
+            const idEntregador = req.usuario.id_usuario;
+
+            const pedidosResult = await pool.query(
+                `SELECT
+                    p.id_pedido,
+                    p.status,
+                    p.rua,
+                    p.numero,
+                    p.complemento,
+                    p.bairro,
+                    p.cidade,
+                    p.ponto_referencia,
+                    p.forma_pagamento,
+                    p.troco,
+                    p.subtotal,
+                    p.taxa_entrega,
+                    p.total,
+                    p.data_coleta,
+                    l.nome AS nome_loja,
+                    l.endereco AS endereco_loja,
+                    u.nome AS nome_cliente,
+                    u.telefone AS telefone_cliente
+                 FROM pedido p
+                 INNER JOIN loja l
+                    ON l.id_loja = p.id_loja
+                 INNER JOIN usuario u
+                    ON u.id_usuario = p.id_usuario
+                 WHERE p.id_entregador = $1
+                   AND p.status IN ('despachado', 'a_caminho')
+                 ORDER BY p.id_pedido DESC`,
+                [idEntregador]
+            );
+
+            const pedidos = [];
+
+            for (const pedido of pedidosResult.rows) {
+                const itensResult = await pool.query(
+                    `SELECT
+                        pi.id_pedido_item,
+                        pi.id_produto,
+                        pi.nome_produto,
+                        pi.preco_unitario,
+                        pi.quantidade,
+                        pi.observacao,
+                        pi.subtotal
+                     FROM pedido_item pi
+                     WHERE pi.id_pedido = $1
+                     ORDER BY pi.id_pedido_item`,
+                    [pedido.id_pedido]
+                );
+
+                const itens = [];
+
+                for (const item of itensResult.rows) {
+                    const complementosResult = await pool.query(
+                        `SELECT
+                            id_complemento,
+                            nome_complemento,
+                            preco
+                         FROM pedido_item_complemento
+                         WHERE id_pedido_item = $1
+                         ORDER BY id_pedido_item_complemento`,
+                        [item.id_pedido_item]
+                    );
+
+                    itens.push({
+                        ...item,
+                        complementos: complementosResult.rows
+                    });
+                }
+
+                pedidos.push({
+                    ...pedido,
+                    itens
+                });
+            }
+
+            return res.json({
+                total: pedidos.length,
+                pedidos
+            });
+
+        } catch (erro) {
+            console.error('Erro ao consultar entrega atual:', erro);
+
+            return res.status(500).json({
+                mensagem: 'Erro ao consultar entrega atual.'
+            });
+        }
+    }
+);
 // Entregador consulta suas ofertas pendentes
 app.get(
     '/entregador/ofertas',
